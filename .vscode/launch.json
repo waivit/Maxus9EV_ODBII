@@ -16,6 +16,14 @@
             "program": "${workspaceFolder}/src/scanner.py",
             "cwd": "${workspaceFolder}/src",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Diag - Battery Dashboard",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/diag.py",
+            "cwd": "${workspaceFolder}/src",
+            "console": "integratedTerminal"
         }
     ]
 }

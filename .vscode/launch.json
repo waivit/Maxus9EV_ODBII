@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Reader - Live Battery Data",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/reader.py",
+            "cwd": "${workspaceFolder}/src",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Scanner - Find PIDs",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/scanner.py",
+            "cwd": "${workspaceFolder}/src",
+            "console": "integratedTerminal"
+        }
+    ]
+}

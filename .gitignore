@@ -11,6 +11,9 @@ captures/
 logs/
 *.csv
 
+# Firmware (Arduino / arduino-cli build output)
+firmware/**/build/
+
 # OS / editor
 Thumbs.db
 .DS_Store

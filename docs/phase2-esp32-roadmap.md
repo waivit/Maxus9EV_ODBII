@@ -20,7 +20,11 @@ formulas in `docs/findings/` (esp. `07-mg-ev-reference.md`).
 
 ---
 
-## Step 1 — Board + toolchain bring-up
+## Step 1 — Board + toolchain bring-up  ✅ DONE (2026-07-16)
+- **Result:** PASS. Chip `ESP32-D0WD-V3` rev 301 (classic dual-core ESP32, same
+  silicon as WROOM-32) → BT Classic confirmed (sketch compiled + chip is not S3/C3);
+  240 MHz, 4 MB flash, ~300 KB free heap; LED blink + serial heartbeat OK. Board is
+  suitable for Step 2. Sketch: `firmware/maxus_bridge/`.
 - **Goal:** confirm hardware + a working build/flash pipeline before any OBD code.
 - **Build:** confirm the chip is **ESP32-WROOM-32** (classic BT; NOT S3/C3 which are
   BLE-only). Set up Arduino-ESP32 (or ESP-IDF). Flash a blink + serial "hello".

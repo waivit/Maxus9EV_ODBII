@@ -9,10 +9,11 @@ Status legend: `open` (untested) · `testing` · `confirmed` · `rejected` ·
 
 | ID | Hypothesis | Status | Evidence / note |
 | --- | --- | --- | --- |
-| H1 | SOC lives on a `B04x` PID on header 7E5. `B040` returns NRC 0x31 (requestOutOfRange); candidate `B04A` returns 0. | open | Scan `B041`–`B07F` on 7E5 (`scanner.py` option 1). See dead ends in `01-confirmed-pids.md`. |
-| H2 | SOH is `B04C` on 7E5 but the current formula is wrong (reads 1.5%). | testing | `02-soh-formula.md` |
+| H0 | `uds.parse` fails to decode 11-bit CAN responses (3-char id), so everything reads "no data". | confirmed | `03-uds-parser-11bit-header.md` — root cause + fix, `test_uds.py` all pass. Was blocking H1/H2/H4. |
+| H1 | SOC lives on a `B04x` PID on header 7E5. `B040`/`B044` return NRC 0x31. | open | Live B040–B060 scan (2026-07-16) — new candidates: `B05C=0x8F=143` (÷2 = **71.5 %**, best lead), `B046=022D`, `B045=3FFF` (sentinel?). `B04A=00`, `B04B=00`. |
+| H2 | ~~SOH is `B04C`~~ → **B04C ruled out** (live raw = `03`, not a health %). True SOH PID unknown. | testing | `02-soh-formula.md` |
 | H3 | Regen level is not exposed via OBD2 (Service 22); it rides the infotainment CAN bus. Needs a passive sniff. | parked | ESP32 + TJA1050 passive CAN sniff. Deprioritized by decision. |
-| H4 | Charge Status `B048` on 7E5 is an enum (observed value 3 = driving?), not fully decoded. | open | Correlate `B048` against Pack Current sign (charge vs discharge vs idle). |
+| H4 | Charge Status `B048` on 7E5 is an enum. | testing | Live `B048=03` confirmed (2026-07-16). Still need values across states (charge/discharge/idle). |
 
 ## Open questions to resolve along the way
 
@@ -22,7 +23,9 @@ Status legend: `open` (untested) · `testing` · `confirmed` · `rejected` ·
   voltage lookup) and simply not published over UDS at all?
 - What are the discrete values of Charge Status `B048` across states
   (off / READY-idle / driving / AC charge / DC charge)?
-- Does `B04C` (SOH) need an INT16 pair rather than a single byte?
+- Which PID actually holds SOH? `B04C` is ruled out (raw = 3). Re-scan a wider
+  range and correlate against the dash battery-health readout.
+- Confirm `B05C` (=143) is SOC by watching it change across a charge/drive cycle.
 
 ## Confirmed so far
 

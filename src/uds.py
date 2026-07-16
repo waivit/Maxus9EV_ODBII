@@ -20,11 +20,16 @@ NRC_TABLE = {
 
 def parse(raw: str) -> dict:
     """
-    Parse a UDS response string.
+    Parse a UDS Service 22 response over 11-bit CAN (ISO 15765-4, ATSP6).
 
-    Single frame layout:
-      [header 6 chars][length 2 chars][service 2 chars][did 4 chars][data...]
-      e.g. 7ED 04 62 B0 42 06 A5
+    Frame layout (ATH1 headers on, ATS0 spaces off):
+      [id 3 chars][PCI 2 chars][service 2 chars][did 4 chars][data...]
+      e.g. 7ED 05 62 B0 41 06 5E   (id 7ED, single frame, 5 payload bytes)
+
+    The PCI nibble selects the ISO-TP frame type:
+      0N  single frame, N payload bytes
+      1.. first frame of a multi-frame message (12-bit length)
+      2N  consecutive frame
 
     Returns dict with keys:
       valid, positive, nrc_code, nrc_name, did, data (list of ints), data_hex
@@ -40,39 +45,39 @@ def parse(raw: str) -> dict:
     }
 
     s = raw.strip().upper().replace(" ", "").replace("\r", "").replace("\n", "")
-    if len(s) < 10:
+    # Need at least id(3) + PCI(2) + one service byte(2).
+    if len(s) < 7:
         return result
 
     result["valid"] = True
-    header = s[0:6]
+    ident   = s[0:3]          # 11-bit CAN id (e.g. 7ED, 7EB)
+    pci_hi  = s[3]            # ISO-TP frame-type nibble
 
-    # Reassemble multi-frame payload
     payload = ""
-    i = 0
-    while i < len(s):
-        if s[i:i+6] != header or i + 7 > len(s):
-            i += 2
-            continue
-        nibble = s[i+6]
-        if nibble == "0":
-            try:
-                length = int(s[i+6:i+8], 16)
-            except ValueError:
-                i += 2
-                continue
-            payload += s[i+8: i+8 + length * 2]
-            i += 8 + length * 2
-        elif nibble == "1":
-            payload += s[i+9: i+9+12]
-            i += 9 + 12
-        elif nibble == "2":
-            payload += s[i+8: i+8+14]
-            i += 8 + 14
-        else:
-            i += 2
-
-    if not payload:
-        payload = s[8:]
+    if pci_hi == "0":
+        # Single frame: low PCI nibble is the payload byte count.
+        try:
+            n = int(s[4], 16)
+        except ValueError:
+            return result
+        payload = s[5: 5 + n * 2]
+    elif pci_hi == "1":
+        # First frame of a multi-frame message. Best-effort reassembly:
+        # 12-bit length in the next 3 nibbles; 6 data bytes follow, then
+        # consecutive (2x) frames each re-prefixed by the id when ATH1 is on.
+        # Unverified until a real multi-frame PID is captured.
+        try:
+            total = int(s[4:7], 16)
+        except ValueError:
+            return result
+        payload = s[7:19]
+        for part in s[19:].split(ident):
+            if part:
+                payload += part[2:]   # drop the consecutive-frame PCI byte
+        payload = payload[: total * 2]
+    else:
+        # Unexpected framing: skip id + PCI and try the remainder.
+        payload = s[5:]
 
     # Strip AA padding
     while payload.endswith("AA"):

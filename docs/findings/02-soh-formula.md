@@ -12,9 +12,10 @@ so the next hardware session goes straight to data.
 ## Raw artifacts
 - Current code (`src/pids.py` `UNDER_INVESTIGATION`):
   `formula = INT16 × 0.1 if len(b) > 1 else b[0] × 0.5` → **reads ≈ 1.5 %**.
-- **TODO at the car:** paste the raw frame here, e.g.
-  `7E5 22 B0 4C` → `7ED __ 62 B0 4C <bytes...>`.
-- **TODO:** reference SOH value from an independent source (e.g. dash = 9_ %).
+- **Live capture (2026-07-16, COM7):** `7E5 22 B0 4C` → `7ED 04 62 B04C 03`
+  → single byte **`0x03` = 3**. (Confirmed once the 11-bit parser was fixed,
+  see `03-uds-parser-11bit-header.md`.)
+- Reference SOH from an independent source: still TODO (dash/dealer readout).
 
 ## Observations
 - Output ≈ 1.5 % is implausible for a working pack — the scaling or the byte
@@ -38,10 +39,15 @@ Once the raw bytes are captured, try these against the reference SOH:
 Pick the candidate whose output matches the reference within ~1–2 %.
 
 ## Verdict
-- **H2 → inconclusive (testing).** Formula confirmed wrong; correct one unknown
-  until raw bytes + a reference SOH are captured.
+- **B04C ruled out as SOH.** The raw value is `03`. The 2026-07-15 prediction
+  ("`byte × 0.5 = 1.5` → raw byte would be 3") was exactly right, but **3 is not a
+  plausible health percentage** — B04C is a small enum/counter, not SOH. Candidate
+  scalings A–E don't apply because this isn't the SOH register.
+- H2 re-framed: **the true SOH PID is unknown.**
 
 ## Next (single most informative test)
-At the car: read `22 B0 4C` on 7E5, record the full raw response **and** an
-independent SOH reference in the same session. Then evaluate candidates A–E above,
-update `src/pids.py`, and set H2 → confirmed here + in `00-hypotheses.md`.
+Re-scan a wider range (e.g. `B0 60`–`B0 FF`, and other prefixes) for a value that
+tracks the dash battery-health readout. Capture that raw value **with** the dash
+SOH reference in the same session, then identify the register and its scaling.
+Note nearby low-byte enums seen live: `B047=00 B048=03 B049=02 B04A=00 B04B=00
+B04C=03 B052=00 B05C=8F`.

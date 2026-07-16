@@ -10,28 +10,25 @@ Status legend: `open` (untested) · `testing` · `confirmed` · `rejected` ·
 | ID | Hypothesis | Status | Evidence / note |
 | --- | --- | --- | --- |
 | H0 | `uds.parse` fails on 11-bit CAN (3-char id) → all "no data"; a 3-char-id rewrite fixes it. | confirmed | `03-uds-parser-11bit-header.md`, `04-pack-current-sign-reversed.md` — bug seen live, fix coded, offline regression green, **live re-verify at the car: all PIDs decode correctly, user-confirmed 2026-07-16**. Was blocking H1/H2/H4. |
-| H1 | SOC lives on a `B0xx` PID on header 7E5; leading candidate `B05C` with scale `byte × ~0.4`. | testing | `05-soc-candidate-b05c.md` — dash 50–55 % vs `B05C=141` → `byte×~0.4` family fits (55–56 %), `÷2` (70.5 %) ruled out. Mid-scale point can't pin exact scale; re-test at high/low SOC after drive+charge. (Ex-look-alike `B0E3=142` now judged a **temperature** (31 °C), not SOC — see `06`, so B05C is the sole SOC lead.) |
-| H2 | ~~SOH is `B04C`~~ → **B04C ruled out** (live raw = `03`, not a health %). True SOH PID unknown. | testing | `02-soh-formula.md` |
+| H1 | **SOC = `B046`** (7E5), formula `(raw−lo)×100/(hi−lo)`; `÷10` ≈ 55.7 % as first approx. | testing | `07-mg-ev-reference.md` — MG/SAIC ref. Our `B046=022D=557` → ≈55.7 %, matches dash 50–55 %. lo/hi need fitting at high/low SOC. (Old `B05C` SOC guess withdrawn — B05C is coolant, see H6.) |
+| H2 | **SOH = `B061`** (7E5), formula `INT16/100`. | testing | `07-mg-ev-reference.md` — MG/SAIC ref. Our `B061=2512=9490` → 94.9 %. Needs a dash/dealer SOH to confirm. (`B04C` ruled out earlier, `02-soh-formula.md`.) |
 | H3 | Regen level is not exposed via OBD2 (Service 22); it rides the infotainment CAN bus. Needs a passive sniff. | parked | ESP32 + TJA1050 passive CAN sniff. Deprioritized by decision. |
-| H4 | Charge Status `B048` on 7E5 is an enum. | testing | Live `B048=03` confirmed (2026-07-16). Still need values across states (charge/discharge/idle). |
+| H4 | Charge Status `B048` on 7E5 is a BMS-status enum. | testing | `07-mg-ev-reference.md` — MG enum: `00`=ConnectedNotCharging, `01`=Idle, `03`=Running, `06`=Charging(AC), `07`=CcsCharging(DC), `08`=AboutToSleep, `0a`=Connected, `0c`=StartingCharge. Our live `B048=03`=Running (was READY) ✓. Verify `06`/`07` while charging. |
 | H5 | Pack Current sign convention is reversed: **positive = discharging, negative = charging** (opposite of `pids.py`'s comment). | confirmed | `04-pack-current-sign-reversed.md` — controlled AC-load experiment (idle→load up→load down), current tracked load direction, not charging. **Fix applied 2026-07-16:** flipped `battery_state()` in `diag.py` (reused by `webdash.py`) + `pids.py` comment; `test_diag.py` guards the mapping. |
-| H6 | A coolant / radiator temperature is exposed on a BMS (7E5) PID. | testing | `06-coolant-temp-candidates.md` — offline decode `byte/2 − 40` of the capture gives candidates (`B0E3`=31 °C; module-record `byte[6]`=39–44 °C; `B0D6`), but an **idle snapshot can't isolate coolant temp** (all ~30 °C). Next: live delta test as thermal load rises; and scan **VCU 7E3** (radiator/motor loop likely there, not on BMS). |
+| H6 | **Battery coolant temp = `B05C`** (7E5), formula `byte×0.5−40`. | testing | `07-mg-ev-reference.md` — MG names B05C `batteryCoolantTempPid`. Our `B05C=8D=141` → 30.5 °C (= idle ambient). Confirm via delta test (must rise under thermal load). Motor/radiator loop temp likely on **VCU 7E3** (unscanned). Candidates in `06-coolant-temp-candidates.md`. |
 
 ## Open questions to resolve along the way
 
-- Full `B04x` range on 7E5 has not been exhaustively scanned — SOC may sit on an
-  untried PID next to the ones already probed.
-- Is SOC perhaps not a single byte but derived (e.g. from a coulomb-count or a
-  voltage lookup) and simply not published over UDS at all?
-- What are the discrete values of Charge Status `B048` across states
-  (off / READY-idle / driving / AC charge / DC charge)?
-- Which PID actually holds SOH? `B04C` is ruled out (raw = 3). Re-scan a wider
-  range and correlate against the dash battery-health readout.
-- Confirm `B05C` is SOC and pin its scale by reading it at high/low SOC (near
-  full/empty), not just mid-scale.
-- Which PID carries coolant / thermal-loop temperature (H6)? Battery-loop
-  candidates are on 7E5 (note 06); the motor/inverter (radiator) loop is likely on
-  VCU 7E3, which hasn't been scanned yet.
+Most discovery questions are now answered by the MG/SAIC reference (`07-…`); what
+remains is **live verification on MAXUS** (see the checklist in note 07):
+- **SOC (B046):** fit the `lo`/`hi` depth-of-discharge limits by reading at known
+  high and low SOC; confirm it tracks the dash across the range.
+- **SOH (B061):** get a dash/dealer SOH % to confirm `INT16/100`.
+- **Coolant (B05C):** confirm it *rises* under thermal load (vs a static battery temp).
+- **BMS status (B048):** confirm `06`/`07` appear while AC/DC charging.
+- **Radiator/motor loop temp:** scan **VCU 7E3** — not on the BMS.
+- Confirm the bonus PIDs (B045 resistance, B047 error, B049/B04A/B052 relays,
+  B0CE range, B06D RTC) behave as the reference suggests.
 
 ## Confirmed so far
 

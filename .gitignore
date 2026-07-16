@@ -10,6 +10,8 @@ venv/
 captures/
 logs/
 *.csv
+# ESP-IDF partition tables are source, not capture logs
+!firmware/**/partitions.csv
 
 # Firmware (Arduino / arduino-cli build output)
 firmware/**/build/

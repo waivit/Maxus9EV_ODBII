@@ -97,7 +97,7 @@ Four fixes were needed vs the naive port, each confirmed by hardware:
 `aa:bb:cc:11:22:33`, legacy PIN `1234`, SPP SDP channel `1`. Config lives in
 `firmware/poc2_idf_spp/sdkconfig.defaults` (SSP off, Classic BT, SPP, BR/EDR-only).
 
-## Step 3 — POC: WiFi AP + web serve **while** BT polls (coexistence)
+## Step 3 — POC: WiFi AP + web serve **while** BT polls (coexistence)  ✅ DONE (2026-07-16)
 - **Goal:** prove BT Classic + WiFi run together on the single 2.4 GHz radio.
 - **Build:** bring up SoftAP (SSID/pass); `WebServer` serving a tiny page + a
   `/data` endpoint returning the one PID from Step 2; keep the BT poll loop running
@@ -109,6 +109,26 @@ Four fixes were needed vs the naive port, each confirmed by hardware:
   (not STA), low poll rate, watch for radio starvation.
 - **Needs ELM327; car READY only to show a real value (coexistence itself provable
   with AT-only traffic).**
+
+### Result (2026-07-16) — PASSED, the coexistence gate is cleared
+`firmware/poc3_idf_coexist/` (evolves poc2 + WiFi SoftAP + HTTP). Verified live:
+WiFi AP (`MaxusBridge` / `192.168.4.1`) + HTTP up in ~1 s, BT connected, and the
+BT poll ran **#1→#107 continuously (all `valid=1`) for ~2.8 min** with a phone
+watching the value live over WiFi — **no reboot, no BT/WiFi dropout**, free heap
+settled and plateaued (~101.7 KB, no leak). BT+WiFi coexistence on one radio is
+proven — the whole bridge concept is feasible.
+
+**Architecture (reused by Step 4/5):** SPP RX callback → FreeRTOS stream buffer →
+`poll_task` (synchronous write→read-until-`>`-or-timeout, mirrors `webdash.py`
+`poller_loop` / `elm327.py:_send_raw`) → mutex-guarded snapshot → HTTP `/` + `/data`.
+Needs a **custom `partitions.csv` + 4 MB flash** (WiFi+HTTP push the app to 1.4 MB,
+over the default 1 MB partition).
+
+**Dashboard shows 4 values** (2×2 grid): Pack Voltage + Batt Temp (confirmed) and
+**SOC (B046) + Coolant (B05C) — TESTING candidates, tagged "test", NOT verified**.
+The on-device values (incl. batt temp) are **not live-verified against the car**
+yet; value correctness is deferred to the Step-6 field checklist. Step 3's pass is
+about **coexistence + the dashboard pipeline**, not the numbers.
 
 ## Step 4 — Port the full poller + UDS decode
 - **Goal:** read and decode all known PIDs, not just one.

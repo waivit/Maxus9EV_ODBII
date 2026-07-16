@@ -21,6 +21,7 @@ pip install -r requirements.txt
 | reader | `cd src && python reader.py` | Read confirmed PIDs + live loop |
 | scanner | `cd src && python scanner.py` | Scan unknown PID ranges, diff snapshots |
 | diag | `cd src && python diag.py` | Battery health dashboard + OK/WARN/ALARM alerts |
+| webdash | `cd src && python webdash.py` | Web dashboard (LAN) — raw hex + ASCII + decoded, auto-refresh |
 
 Or use **VSCode Run & Debug** (F5) and select a launch config.
 

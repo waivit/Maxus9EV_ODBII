@@ -9,7 +9,7 @@ Status legend: `open` (untested) · `testing` · `confirmed` · `rejected` ·
 
 | ID | Hypothesis | Status | Evidence / note |
 | --- | --- | --- | --- |
-| H0 | `uds.parse` fails to decode 11-bit CAN responses (3-char id), so everything reads "no data". | confirmed | `03-uds-parser-11bit-header.md` — root cause + fix, `test_uds.py` all pass. Was blocking H1/H2/H4. |
+| H0 | `uds.parse` fails on 11-bit CAN (3-char id) → all "no data"; a 3-char-id rewrite fixes it. | testing | `03-uds-parser-11bit-header.md` — bug seen live; fix coded + offline regression green; **awaiting live re-verify at the car**. Was blocking H1/H2/H4. |
 | H1 | SOC lives on a `B04x` PID on header 7E5. `B040`/`B044` return NRC 0x31. | open | Live B040–B060 scan (2026-07-16) — new candidates: `B05C=0x8F=143` (÷2 = **71.5 %**, best lead), `B046=022D`, `B045=3FFF` (sentinel?). `B04A=00`, `B04B=00`. |
 | H2 | ~~SOH is `B04C`~~ → **B04C ruled out** (live raw = `03`, not a health %). True SOH PID unknown. | testing | `02-soh-formula.md` |
 | H3 | Regen level is not exposed via OBD2 (Service 22); it rides the infotainment CAN bus. Needs a passive sniff. | parked | ESP32 + TJA1050 passive CAN sniff. Deprioritized by decision. |

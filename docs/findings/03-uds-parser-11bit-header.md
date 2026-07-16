@@ -39,18 +39,23 @@ MAXUS runs **11-bit CAN only** (`ATSP6`). Correct single-frame parse:
 multi-frame path (`PCI '1'`/`'2'`) is added best-effort but is unverified.
 
 ## Verdict
-- **confirmed (offline).** `parse()` rewritten for 11-bit CAN (`ident = s[0:3]`,
-  single frame `payload = s[5:5+2N]`); `src/test_uds.py` decodes all captured
-  vectors correctly and the negative case yields `nrc_code == 0x31`. Decoded
-  values are physically sane (Bus 407.5 V, Cell max 3.778 V). Live re-check at the
-  vehicle still pending (separate session).
+- **testing.** Two separate claims, don't conflate them:
+  - The **bug is real** — observed live: every PID returned "no data" while the
+    ELM raw clearly held valid `62 ...` frames. That is car-derived evidence.
+  - The **fix works** — NOT yet confirmed. `parse()` was rewritten for 11-bit CAN
+    (`ident = s[0:3]`, single frame `payload = s[5:5+2N]`) and passes an offline
+    **regression guard** (`src/test_uds.py`) built from the captured samples. That
+    only shows the code matches my byte interpretation — it is circular as proof
+    and is NOT live verification. Status stays `testing` until re-checked at the car.
 
-## Next
-Re-run `webdash.py` on COM7 at the car to confirm the dashboard shows real values
-instead of "no data" (deferred). Then chase SOC (H1, candidate B05C) and the true
-SOH PID (H2 — B04C ruled out, see below).
+## Next (the actual test — at the vehicle, user runs it)
+Re-run `webdash.py` on COM7 with the car READY and confirm the dashboard now shows
+real values instead of "no data", cross-checked against the dash. Only then does
+this become a finding (confirmed/rejected). Then chase SOC (H1, candidate B05C)
+and the true SOH PID (H2 — B04C ruled out, see below).
 
-## Result (2026-07-16, offline)
-`python test_uds.py` → **ALL PASS** (8 positive DIDs incl. 3-byte cell data and
-the 7EB/0112 VCU frame; 1 NRC 0x31; 2 physical-sanity checks). The fix is shared,
-so reader / scanner / diag / webdash all benefit without changes.
+## Offline regression (2026-07-16, not verification)
+`python test_uds.py` → decode matches all captured samples (8 positive DIDs incl.
+3-byte cell data and the 7EB/0112 VCU frame; 1 NRC 0x31; 2 sanity checks). This is
+a regression guard only. The fix is shared, so reader / scanner / diag / webdash
+all pick it up once confirmed live.

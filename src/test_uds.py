@@ -1,6 +1,13 @@
 """
-Offline tests for uds.parse against real 11-bit CAN responses captured from the
-MAXUS 9 EV (ELM327 v1.5, COM7, 2026-07-16). No hardware needed.
+Regression guard for uds.parse against real 11-bit CAN responses captured from
+the MAXUS 9 EV (ELM327 v1.5, COM7, 2026-07-16). No hardware needed.
+
+SCOPE: this only checks that the decode logic still matches these known captured
+bytes (guards against future breakage). It is built from the same samples the
+parser was written against, so it is NOT verification of the hypothesis and NOT a
+substitute for a live test at the vehicle — that is where pass/fail is really
+decided. See docs/findings/03-uds-parser-11bit-header.md.
+
 Run: python test_uds.py
 """
 
@@ -53,6 +60,6 @@ check("Cell V Max ~= 3.778 V", abs(((cmax[0] * 256 + cmax[1]) * 0.001) - 3.778) 
 
 print()
 if failures:
-    print(f"RESULT: {failures} FAILED")
+    print(f"REGRESSION: {failures} FAILED")
     raise SystemExit(1)
-print("RESULT: ALL PASS")
+print("REGRESSION: OK (decode matches captured samples; NOT live verification)")

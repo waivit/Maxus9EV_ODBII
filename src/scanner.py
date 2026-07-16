@@ -6,15 +6,32 @@ Used for discovering new PIDs (e.g. SOC, regen level).
 
 import time
 import sys
+import os
+import json
+from datetime import datetime
 from elm327 import ELM327, select_com_port
 from uds import parse
 
+CAPTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "captures")
+
+
+def save_capture(entries: list, path: str):
+    """Append raw scan entries (list of dict) to a JSONL capture file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
 
 def scan_range(elm: ELM327, header: str, prefix: str,
-               lo: int = 0x00, hi: int = 0xFF) -> list:
+               lo: int = 0x00, hi: int = 0xFF, capture_path: str = None) -> list:
     """
     Scan Service 22 PIDs prefix+lo to prefix+hi on given header.
     Returns list of (pid_hex, data_bytes) for positive responses.
+
+    If capture_path is given, every attempted PID (positive AND negative/NRC) is
+    appended to that JSONL file immediately, so results survive a Ctrl+C and can
+    be re-analysed offline later without returning to the vehicle.
     """
     print(f"\nScanning {header} 22 {prefix}{lo:02X}-{prefix}{hi:02X}...")
     elm.set_header(header)
@@ -38,6 +55,18 @@ def scan_range(elm: ELM327, header: str, prefix: str,
         raw  = resp.upper().replace(" ","").replace("\r","").replace("\n","")
         p    = parse(raw)
 
+        if capture_path:
+            save_capture([{
+                "header":   header,
+                "pid":      f"{prefix}{b:02X}",
+                "cmd":      cmd,
+                "raw":      raw,
+                "positive": p["positive"],
+                "data":     p["data"],
+                "data_hex": p["data_hex"],
+                "nrc_name": p["nrc_name"],
+            }], capture_path)
+
         if p["positive"]:
             hex_d = " ".join(f"{x:02X}" for x in p["data"])
             dec_d = " ".join(str(x) for x in p["data"])
@@ -47,6 +76,8 @@ def scan_range(elm: ELM327, header: str, prefix: str,
         print(f"\r  {b-lo+1}/{hi-lo+1}", end="", flush=True)
 
     print(f"\n  Done. Found {len(found)} PIDs.")
+    if capture_path:
+        print(f"  Raw capture saved: {capture_path}")
     return found
 
 
@@ -100,15 +131,19 @@ if __name__ == "__main__":
     print("  3 - Custom range")
     choice = input("Choice: ").strip()
 
+    def capture_path_for(header: str, prefix: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(CAPTURES_DIR, f"{ts}_{header}_{prefix}.jsonl")
+
     if choice == "1":
-        scan_range(elm, "7E5", "B0")
+        scan_range(elm, "7E5", "B0", capture_path=capture_path_for("7E5", "B0"))
     elif choice == "2":
-        scan_range(elm, "7E3", "B4")
+        scan_range(elm, "7E3", "B4", capture_path=capture_path_for("7E3", "B4"))
     elif choice == "3":
         hdr = input("Header (e.g. 7E5): ").strip()
         pfx = input("Prefix (e.g. B0): ").strip()
         lo  = int(input("From (hex, e.g. 00): ").strip(), 16)
         hi  = int(input("To   (hex, e.g. FF): ").strip(), 16)
-        scan_range(elm, hdr, pfx, lo, hi)
+        scan_range(elm, hdr, pfx, lo, hi, capture_path=capture_path_for(hdr, pfx))
 
     elm.disconnect()

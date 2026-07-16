@@ -55,7 +55,9 @@ need to be flipped.
   the full root-cause record; this note supplies the live confirmation evidence.
 
 ## Next
-Fix the sign convention as its own iteration (separate approval): flip the
-`battery_state()` charge/discharge branches in `diag.py`/`webdash.py`, and correct
-the misleading comment in `pids.py`. Re-run the offline regression, then re-verify
-live at the vehicle before closing.
+**Fix applied 2026-07-16** (own iteration): flipped the `battery_state()`
+charge/discharge branches in `diag.py` (reused by `webdash.py`), corrected the
+`pids.py` comment, made the webdash state pill informational (neutral, not a
+warning), and added `test_diag.py` as a regression guard for the mapping. Offline
+regression green. Optional non-blocking sanity check next time at the car: the
+dashboard should read "DISCHARGING" at idle instead of "CHARGING".

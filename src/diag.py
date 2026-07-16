@@ -98,13 +98,18 @@ def collect(elm: ELM327) -> dict:
 
 
 def battery_state(pack_current: float | None) -> str:
-    """Derive charge/discharge/idle from pack current sign (+ = charging)."""
+    """Derive charge/discharge/idle from pack current sign (+ = discharging).
+
+    Sign convention confirmed live 2026-07-16 (H5, see
+    docs/findings/04-pack-current-sign-reversed.md): positive Pack Current means
+    the pack is supplying the HV bus (discharging), negative means charging.
+    """
     if pack_current is None:
         return "unknown"
     if pack_current > 1.0:
-        return "CHARGING"
-    if pack_current < -1.0:
         return "DISCHARGING"
+    if pack_current < -1.0:
+        return "CHARGING"
     return "idle"
 
 

@@ -49,7 +49,7 @@ CONFIRMED = [
         command = "22 B0 43",
         formula = lambda b: ((b[0]*256)+b[1]) * 0.025 - 1000,
         unit    = "A",
-        notes   = "Positive = charging, negative = discharging",
+        notes   = "Positive = discharging, negative = charging",  # confirmed live, H5
     ),
     PID(
         name    = "Batt Temp High",

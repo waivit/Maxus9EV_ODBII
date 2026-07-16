@@ -206,8 +206,8 @@ async function tick(){
   try{
     const r = await fetch("/data?interval=" + (iv/1000));
     const d = await r.json();
-    pill(document.getElementById("state"),
-         d.state==="CHARGING"?"OK":d.state==="DISCHARGING"?"WARN":"muted");
+    // State is informational (charge/discharge/idle is normal), not an alert.
+    pill(document.getElementById("state"), "muted");
     document.getElementById("state").textContent = d.state;
     pill(document.getElementById("overall"), d.overall);
     document.getElementById("updated").textContent = d.updated;

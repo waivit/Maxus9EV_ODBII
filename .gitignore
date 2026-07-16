@@ -14,6 +14,10 @@ logs/
 # Firmware (Arduino / arduino-cli build output)
 firmware/**/build/
 
+# ESP-IDF generated per-project config (regenerated from sdkconfig.defaults)
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+
 # OS / editor
 Thumbs.db
 .DS_Store

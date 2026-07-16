@@ -33,7 +33,7 @@ formulas in `docs/findings/` (esp. `07-mg-ev-reference.md`).
 - **Risk:** wrong chip variant → blocks everything (buy WROOM-32).
 - **No car / no ELM327 needed.**
 
-## Step 2 — POC: Bluetooth SPP → ELM327 (1 PID)
+## Step 2 — POC: Bluetooth SPP → ELM327 (1 PID)  ✅ DONE (2026-07-16, ESP-IDF)
 - **Goal:** prove the ESP32 can talk to the ELM327 over BT Classic.
 - **Build:** `BluetoothSerial` as SPP master; discover/connect to the ELM327
   (by name or MAC); port the AT init sequence from `src/elm327.py`
@@ -44,6 +44,58 @@ formulas in `docs/findings/` (esp. `07-mg-ev-reference.md`).
 - **Success:** raw `7ED05 62 B042 …` bytes seen over BT on the ESP32 serial.
 - **Risk:** BT pairing/PIN, SPP-client quirks, finding the ELM327 address.
 - **Needs ELM327 (AT part) + car READY (real PID part).**
+
+### Finding (2026-07-16) — Arduino path ruled out, pivoting to ESP-IDF
+Two Arduino (`arduino-esp32` `BluetoothSerial`) attempts, both on real hardware
+(adapter name `OBDII`, MAC `aa:bb:cc:11:22:33`):
+1. **Default security** — `connect(address)` and `connect(name)` both failed.
+2. **Unauthenticated** (`ESP_SPP_SEC_NONE`, no `setPin`) — scan found the adapter
+   fine, but `connect()` **FAILED all 3 retries**.
+
+The user separately confirmed that pairing this adapter from Windows **requires
+PIN 1234** (an incorrect PIN fails pairing outright) — i.e. this is a **legacy
+PIN-pairing** device, not SSP/Just-Works. Combined with (2) failing, the adapter
+only accepts an **authenticated, legacy-PIN-bonded** link. Arduino's
+`BluetoothSerial` cannot reliably drive legacy PIN pairing (SSP is baked in;
+`setPin()` doesn't force legacy mode) — this is a known upstream limitation, now
+confirmed by hardware evidence, not just literature.
+
+**Decision:** move Step 2 to **ESP-IDF**, where `menuconfig` can disable SSP and
+the app answers the legacy PIN request directly (`esp_bt_gap_set_pin` /
+`esp_bt_gap_pin_reply`), matching what Windows does. New POC:
+`firmware/poc2_idf_spp/`. The Arduino sketch `firmware/poc2_bt_elm327/` is kept
+as-is — a record of the ruled-out path, not part of the shipped bridge.
+
+### Result (2026-07-16) — ESP-IDF POC PASSED end to end
+`firmware/poc2_idf_spp/` (ESP-IDF v5.3.3) connects and reads a real PID. Full
+serial trace verified live: legacy PIN auth → RFCOMM open → all 8 AT init cmds →
+one PID read:
+```
+Legacy PIN auth SUCCESS with OBDII
+BT connected (handle=129)
+--> ATZ      <-- ELM327 v1.5
+--> ATE0..ATSP6, ATSH 7E5   <-- OK (each)
+--> 22 B0 42 <-- 7ED0562B0420644   → 0x0644 * 0.25 = 401.0 V (Pack Voltage B042)
+```
+Four fixes were needed vs the naive port, each confirmed by hardware:
+1. **Controller mode `BR/EDR-only`** (`CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY`) — the
+   default BTDM mode made `esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)` abort
+   with `ESP_ERR_INVALID_ARG`.
+2. **Match by MAC, not name** — this adapter's inquiry result carries no BDNAME
+   (`found device: (no name)`); name matching never fires. Known MAC hard-coded.
+3. **L2CAP ERTM disabled** via `esp_spp_enhanced_init(.enable_l2cap_ertm=false)` —
+   the adapter (BT 2.x, Basic Mode only) rejected ERTM config with an immediate
+   `Incompatible CFG` L2CAP failure; this was the real connect blocker (SSP-off +
+   `SEC_AUTHENTICATE|ENCRYPT` alone did not fix it).
+4. **Sanitize AT replies before logging** — the ELM327 emits non-UTF-8 noise bytes
+   while it resets after ATZ (hexdump: `...5A 0D **FC** 0D...`); printed raw they
+   crashed esp-idf-monitor on the Windows cp1252 console (looked like a hang). Log
+   now maps non-printable → space, drops `>`, trims (mirrors `elm327.py`), plus a
+   hex dump per reply. Monitor also run with `chcp 65001` + `PYTHONIOENCODING=utf-8`.
+
+**Reusable facts for later steps:** adapter BT name `OBDII`, MAC
+`aa:bb:cc:11:22:33`, legacy PIN `1234`, SPP SDP channel `1`. Config lives in
+`firmware/poc2_idf_spp/sdkconfig.defaults` (SSP off, Classic BT, SPP, BR/EDR-only).
 
 ## Step 3 — POC: WiFi AP + web serve **while** BT polls (coexistence)
 - **Goal:** prove BT Classic + WiFi run together on the single 2.4 GHz radio.

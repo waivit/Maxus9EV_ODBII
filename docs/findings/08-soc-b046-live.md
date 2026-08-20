@@ -87,3 +87,31 @@ Fast heuristic: dash `49 = 0x31`, dash `80 = 0x50` — look for a byte reading
 `0x31 → 0x50` (SOC ×1) or `0x62 → 0xA0` (×0.5). Also capture the **full** `B046`
 response (all bytes) at both SOCs — the SOC may live in a later byte than the
 INT16 we currently read.
+
+---
+
+## Follow-up (2026-08-14) — settled re-measurement RESOLVES it (see note 10)
+
+The `poc4` live car test (`10-poc4-live-crosscheck.md`) re-took the two points with
+the car **settled**, and the picture is now clean:
+
+| State | Dash SOC | Bridge (B046÷10) | B046 INT16 | dash − bridge |
+| --- | --- | --- | --- | --- |
+| low     | 49 % | 45.2 | 452 | +3.8 |
+| high (settled) | 80 % | **75.2** | **752** | +4.8 |
+
+- The original high point in the table above (dash 80 → **57.2**, INT16 572) is
+  **superseded**. Re-read settled, dash 80 → **75.2** — so the **staleness theory
+  is confirmed**: 57.2 was a Raw SOC that had not updated right after charging.
+  That single stale sample is what produced the earlier "non-collinear / ÷10
+  rejected" conclusion. **Retract that rejection.**
+- With both points settled, `B046 ÷ 10` = **Raw SOC** and the **dash ≈ Raw + ~4 %**
+  (offset 3.8→4.8, near constant). Linear fit: **`Display ≈ 1.033 × Raw + 2.3`**,
+  gain ~1.03 (not MG's 1.1 → BMS-version-specific, MAXUS ≠ MG ZS).
+- Constant-offset (`Raw + 4`) vs linear are indistinguishable on two points
+  (< 1 % apart across the range); either is ~±1 % accurate.
+
+**Revised verdict (supersedes the section above):** `B046÷10` = Raw SOC; dash SOC
+= Raw + ~4 %. The ÷10 error was never the formula — it was one stale post-charge
+sample. Remaining work: one settled **low-SOC (~20–30 %)** point to lock
+offset-vs-linear, then apply to the dashboard.

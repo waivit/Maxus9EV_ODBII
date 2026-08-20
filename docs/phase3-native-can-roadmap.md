@@ -63,6 +63,34 @@ tabbed UI from poc3/poc4. Only the **transport** changes: SPP callbacks →
 
 ---
 
+## Result (2026-08-20) — Steps 1-3 all passed in one session; Step 4 is blocked
+
+`firmware/poc5_s3_can/` on the real vehicle. Full write-up:
+`docs/findings/11-native-can-ecu-scan.md`.
+
+**The OBD port is gateway-isolated.** Listen-only saw **zero** frames at all four
+bitrates with `bus_err=0`, while the harness measured a healthy **63 Ω** and the
+desk self-test had already proven driver/GPIO/transceiver. The same wires answer
+a Service-22 request in **~10 ms**. The port answers requests but forwards no
+internal bus traffic.
+
+Consequences for this roadmap:
+- **Step 1 passes on a revised criterion.** "Frames arrive passively" is
+  unachievable on this vehicle *by design*, so the transport is proven by a
+  correct request/response round trip instead (Pack Voltage `B042` = 390.25 V).
+  The desk self-test remains the check for the driver/pin/transceiver layer.
+- **Steps 2 and 3 passed at the same time** — active Service 22 decodes confirmed
+  PIDs, and ISO-TP multi-frame delivered `F194` (BMS software version) and `F190`
+  (VIN), the capability the ELM327 path never had.
+- **Step 4 (passive sniffing) is not possible through this connector** — proven,
+  not assumed. **H3 (regen) is therefore rejected via OBD**; it would need a tap
+  on an internal bus elsewhere in the vehicle.
+- **Bonus:** an ECU/DID sweep of `0x700`-`0x7FF` found **33 ECUs and 1824 readable
+  DIDs** (BMS alone exposes 163 where we used ~10), plus 12 per-cell module groups
+  that turn out to be single-frame.
+
+---
+
 ## Step 1 — Board + TWAI bring-up (listen-only)
 - **Goal:** prove the board receives real bus traffic (GPIO15/16 + transceiver + 500 k).
 - **Build:** TWAI driver install, 500 kbps, `TWAI_MODE_LISTEN_ONLY`; a task that

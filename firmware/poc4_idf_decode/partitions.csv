@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# Custom 4 MB layout - the default 1 MB app partition overflows once WiFi +
+# HTTP server are added on top of the BT/Bluedroid stack. ~2 MB factory app.
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x1F0000,

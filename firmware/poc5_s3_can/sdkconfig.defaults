@@ -1,0 +1,10 @@
+# MAXUS 9 EV - Phase 3 Step 1 (native CAN bring-up, Waveshare ESP32-S3-RS485-CAN)
+#
+# Deliberately minimal: no Bluetooth, no WiFi. This POC only brings up the TWAI
+# (CAN) controller in listen-only mode and reports over USB serial, so the
+# default partition table is plenty - only the flash size needs declaring.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Console: the ESP32-S3 default is UART0 primary + USB-Serial-JTAG secondary, so
+# logs appear whether this board's USB-C is a UART bridge or the native USB port.
+# Left at the defaults on purpose - do not pin it to one of the two.

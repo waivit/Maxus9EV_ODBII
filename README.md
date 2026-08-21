@@ -5,12 +5,14 @@ adapter, or natively over CAN with an ESP32-S3.
 
 ## Project goals
 
-1. **Read the regenerative braking level (High / Medium / Low).** ⭐ *Primary.*
-   Tracked as **H3** in [`docs/findings/00-hypotheses.md`](docs/findings/00-hypotheses.md).
-   A passive CAN sniff cannot reach it — the OBD port is gateway-isolated
-   ([`11-native-can-ecu-scan.md`](docs/findings/11-native-can-ecu-scan.md)) — so the
-   method is to scan every DID at each regen level and diff the captures with
-   `tools/analyze_scan.py diff`.
+1. ~~**Read the regenerative braking level (High / Medium / Low).**~~ ✅ **DONE** —
+   it is `22 B4 80` on header `7E3`: `00`=Low, `01`=Medium, `02`=High. Found by
+   scanning every DID at each of the three levels and keeping the one that stepped
+   through in order ([`13-regen-level-found.md`](docs/findings/13-regen-level-found.md)).
+   A passive sniff could never have reached it — the OBD port is gateway-isolated
+   ([`11-native-can-ecu-scan.md`](docs/findings/11-native-can-ecu-scan.md)) — but the
+   setting is *stored*, and stored values are what Service 22 reads.
+   *Open follow-on: can it be **written**? Untested.*
 2. **Read accurate battery state** — SOC, SOH, temperatures, per-cell voltages.
 3. **A standalone in-car device** that serves a live dashboard to a phone, with no
    PC and no phone app (Phase 2 / Phase 3 roadmaps in [`docs/`](docs/)).
@@ -72,7 +74,11 @@ The tables below are the quick overview; the finding notes are the deeper record
 | Cell V Max | 7E5 | 22 B0 58 | INT16 * 0.001 | V |
 | Cell V Min | 7E5 | 22 B0 59 | INT16 * 0.001 | V |
 | 12V Battery | 7E3 | 22 01 12 | byte * 1.0 | V |
-| Charge Status | 7E5 | 22 B0 48 | byte | - |
+| Charge Status | 7E5 | 22 B0 48 | byte (01=Idle, 03=Running) | - |
+| **Regen Level** | **7E3** | **22 B4 80** | **byte: 0=Low, 1=Medium, 2=High** | **-** |
+| Motor Temp | 7E3 | 22 B4 05 | byte - 40 | °C |
+| Motor Speed | 7E3 | 22 B4 02 | INT16 - 0x7FFF | rpm |
+| SOC (Raw) | 7E5 | 22 B0 46 | INT16 / 10 | % |
 
 ## ECU Map
 
@@ -96,7 +102,7 @@ See [`docs/findings/00-hypotheses.md`](docs/findings/00-hypotheses.md) for statu
 | SOC | H1 | B046/10 = Raw SOC; dash = Raw + ~4%. Needs one settled low-SOC point to lock. |
 | SOH | H2 | B061/100 = 94.3%, consistent across sessions. Needs a dealer/dash SOH to confirm. |
 | Charge Status | H4 | B048 enum not fully decoded (3 = driving?). |
-| **Regen Level** | **H3** | ⭐ **Primary goal.** Passive sniff ruled out; hunt it by diffing DID scans at Low/Medium/High. |
+
 
 ## Protocol
 

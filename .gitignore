@@ -23,3 +23,10 @@ firmware/**/sdkconfig.old
 # OS / editor
 Thumbs.db
 .DS_Store
+
+# WiFi credentials - real values never get committed (see wifi_creds.h.example)
+firmware/**/wifi_creds.h
+
+# ESP-IDF managed components downloaded at build time
+firmware/**/managed_components/
+firmware/**/dependencies.lock

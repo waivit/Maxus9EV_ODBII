@@ -14,9 +14,10 @@ OBD2 CAN-H/CAN-L ──► [120Ω OFF] TWAI transceiver ──► ESP32-S3 ─�
 **Why native CAN (vs the ELM327 bridge):**
 - **ISO-TP multi-frame** is reliable → unlocks `F194` **BMS software version** (the
   key to locking the SOC transform, H1), `F190` VIN, and per-cell voltages.
-- **Passive sniffing** (listen-only) → broadcast frames the OBD request/response
-  path never exposes: direct **dash SOC**, **regen level** (H3, currently parked),
-  gear, etc.
+- **Passive sniffing** (listen-only) → *hoped* to expose broadcast-only values such
+  as dash SOC and regen level. **This turned out to be impossible on this vehicle**
+  (the OBD port is gateway-isolated — see the Result section); regen was instead
+  found by active scanning, and a dash-SOC broadcast remains out of reach.
 - **Faster** — no AT text layer, no ELM per-command overhead.
 - **No BT** — the ESP32-S3 has no BT Classic, but native CAN doesn't need it, and so
   **WiFi runs alone: the Phase-2 radio-coexistence risk (#1) disappears.**
@@ -83,8 +84,9 @@ Consequences for this roadmap:
   PIDs, and ISO-TP multi-frame delivered `F194` (BMS software version) and `F190`
   (VIN), the capability the ELM327 path never had.
 - **Step 4 (passive sniffing) is not possible through this connector** — proven,
-  not assumed. **H3 (regen) is therefore rejected via OBD**; it would need a tap
-  on an internal bus elsewhere in the vehicle.
+  not assumed. *(This originally concluded regen was therefore unreachable via OBD.
+  Wrong: sniffing is one route, not the only one — regen was later found by active
+  Service-22 scanning, Step 4b.)*
 - **Bonus:** an ECU/DID sweep of `0x700`-`0x7FF` found **33 ECUs and 1824 readable
   DIDs** (BMS alone exposes 163 where we used ~10), plus 12 per-cell module groups
   that turn out to be single-frame.
@@ -128,8 +130,14 @@ Consequences for this roadmap:
 - **Impact:** `F194` is the value the MAXUS Display-SOC transform is keyed on — this is
   what finally **locks H1** (see `10-poc4-live-crosscheck.md`).
 
-## Step 4b — Regen-level hunt via state diff  ⭐ **PRIMARY PROJECT GOAL**
-*Replaces Step 4 for the regen objective, since passive sniffing is unavailable here.*
+## Step 4b — Regen-level hunt via state diff  ✅ **DONE (2026-08-21)**
+**Result: `7E3 B480`** — `00`=Low, `01`=Medium, `02`=High. Of 309 DIDs read at all
+three levels, exactly one stepped through in selector order; a two-level diff left
+five indistinguishable candidates. Three scans took ~10 minutes total, triggered
+and downloaded over WiFi with no laptop in the car. See
+`docs/findings/13-regen-level-found.md`.
+
+### Method used (kept as the record)
 - **Goal:** find the DID that holds the **regenerative braking level** (High /
   Medium / Low) — **H3**, the project's primary goal.
 - **Why this works where sniffing does not:** regen level is a *driver-selected
@@ -160,7 +168,13 @@ Consequences for this roadmap:
   any regen frame.
 - **Risk:** large volume of unknown frames — filter by ID, capture windows.
 
-## Step 5 — WiFi dashboard (no BT, no coexistence)
+## Step 5 — WiFi dashboard (no BT, no coexistence)  ✅ **DONE (2026-08-21)**
+Built as APSTA (joins the house router *and* keeps its own AP for when the car is
+out of range) with mDNS at `http://maxus.local/`, six tabs, plus two capabilities
+the regen hunt needed: **scan over WiFi** (`/scan/start`, `/scan/status`,
+`/scan/result`) and **OTA** (`POST /update`) so the board never needs the USB
+cable again. OTA verified: 858 KB in 8.8 s, rebooted into the other slot.
+
 - **Goal:** untethered live view, no laptop.
 - **Build:** reuse poc3/poc4 WiFi SoftAP + `esp_http_server` + the tabbed UI, reading
   the same mutex-guarded snapshot the CAN poller writes. 16 MB flash → no partition

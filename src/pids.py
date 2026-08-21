@@ -145,6 +145,17 @@ CONFIRMED = [
         notes   = "IMCU. 0 idle -> 330 while driving (note 10)",
     ),
     PID(
+        name    = "Regen Level",
+        header  = "7E3",
+        command = "22 B4 80",
+        formula = lambda b: float(b[0]),
+        unit    = "",
+        # H3, the project's primary goal. Found by diffing full DID scans taken at
+        # each of the three selector positions: the only one of 309 DIDs that
+        # stepped 00 -> 01 -> 02 in order (docs/findings/13-regen-level-found.md).
+        notes   = "enum: 0=Low, 1=Medium, 2=High. On IMCU (7E3)",
+    ),
+    PID(
         name    = "Odometer",
         header  = "7E3",
         command = "22 E1 01",

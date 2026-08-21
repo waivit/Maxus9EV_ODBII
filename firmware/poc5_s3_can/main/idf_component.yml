@@ -1,0 +1,8 @@
+## Managed component dependencies.
+## mDNS left ESP-IDF core in v5.x, so it is pulled from the component registry
+## at build time. It gives the board a stable name (http://maxus.local/) instead
+## of whatever address DHCP hands out.
+dependencies:
+  espressif/mdns: "^1.2.0"
+  idf:
+    version: ">=5.0"

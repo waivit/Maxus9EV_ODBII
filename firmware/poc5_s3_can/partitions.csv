@@ -1,0 +1,12 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# OTA layout: two app slots so firmware can be replaced over WiFi. The board
+# lives in the car, so needing a USB cable for every change is the thing this
+# removes - after one final cable flash, updates go over the network.
+#
+# otadata records which slot to boot. The app is ~850 KB today, so 3 MB per slot
+# leaves plenty of room; 16 MB of flash means we do not have to be frugal.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+phy_init, data, phy,     0x10000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x300000,
+ota_1,    app,  ota_1,   0x320000, 0x300000,

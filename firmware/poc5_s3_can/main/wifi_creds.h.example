@@ -1,0 +1,23 @@
+/*
+ * WiFi credentials template.
+ *
+ * Copy this file to `wifi_creds.h` in the same directory and fill in your own
+ * router's SSID and password. `wifi_creds.h` is gitignored on purpose so real
+ * credentials never reach the repository.
+ *
+ *     cp main/wifi_creds.h.example main/wifi_creds.h
+ */
+#pragma once
+
+/* Home/office router the board joins as a station (STA).
+ * Leave STA_SSID empty ("") to run access-point only. */
+#define STA_SSID  "your-wifi-name"
+#define STA_PASS  "your-wifi-password"
+
+/* The board's own access point, always available so the dashboard still works
+ * away from the router (in the car). Password must be 8+ chars for WPA2. */
+#define AP_SSID   "MaxusBridge"
+#define AP_PASS   "maxus1234"
+
+/* mDNS hostname -> http://maxus.local/ */
+#define MDNS_HOST "maxus"

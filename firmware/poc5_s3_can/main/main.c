@@ -17,6 +17,8 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -24,6 +26,16 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/twai.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "nvs_flash.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "mdns.h"
+#include "wifi_creds.h"
 
 static const char *TAG = "poc5_can";
 
@@ -43,8 +55,10 @@ static const char *TAG = "poc5_can";
                            /* the reply. Transmits on the vehicle bus (read-only */
                            /* UDS - exactly what the ELM327 path has always done)*/
 #define MODE_SCAN      3   /* Discover responding ECUs, then sweep DID ranges.   */
+#define MODE_DASH      4   /* Poll the PID table and serve a web dashboard over  */
+                           /* WiFi (APSTA: joins the router AND runs its own AP).*/
 
-#define RUN_MODE MODE_SCAN
+#define RUN_MODE MODE_DASH
 
 /* Active-mode request target. Same addressing the ELM327 path uses: BMS request
  * on 7E5, response on 7ED (docs/findings/01-confirmed-pids.md). B042 = Pack
@@ -202,7 +216,7 @@ static void run_selftest(void)
     twai_tear_down();
 }
 
-#elif RUN_MODE == MODE_ACTIVE || RUN_MODE == MODE_SCAN   /* ==== Active UDS ==== */
+#elif RUN_MODE == MODE_ACTIVE || RUN_MODE == MODE_SCAN || RUN_MODE == MODE_DASH
 
 /* Requests to fire each cycle. Mixes confirmed PIDs (a known-good baseline) with
  * the two multi-frame values the ELM327 path could never reach: F194 is the BMS
@@ -226,6 +240,37 @@ static const uds_probe_t PROBES[] = {
 #define N_PROBES (sizeof(PROBES) / sizeof(PROBES[0]))
 
 #define UDS_BUF 256
+
+/* ---- Scan definitions, shared by MODE_SCAN (serial) and MODE_DASH (WiFi) ---- */
+
+/* Diagnostic request range. Hard limit - see the guard in uds_xfer(). */
+#define SCAN_REQ_LO   0x700
+#define SCAN_REQ_HI   0x7FF
+#define SCAN_MAX_ECUS   48
+
+/* DID blocks worth sweeping: every PID confirmed so far lives in the B0/B3/B4/
+ * B7/B9/BA pages, F1 is the standard identification page, 00 the generic OBD
+ * one (docs/findings/09-ovms-cross-reference.md). */
+static const struct { uint16_t lo, hi; } DID_RANGES[] = {
+    { 0xB000, 0xB0FF }, { 0xB300, 0xB3FF }, { 0xB400, 0xB4FF },
+    { 0xB700, 0xB7FF }, { 0xB900, 0xB9FF }, { 0xBA00, 0xBAFF },
+    { 0xF100, 0xF1FF }, { 0x0000, 0x00FF },
+};
+#define N_DID_RANGES (sizeof(DID_RANGES) / sizeof(DID_RANGES[0]))
+
+/* Names for the ECUs identified from their own ISO 14229 identification DIDs
+ * (docs/findings/12-ecu-identification-and-bms-structure.md). */
+static const char *ecu_name(uint32_t req_id)
+{
+    switch (req_id) {
+    case 0x704: return "BDU";
+    case 0x747: return "AVM";
+    case 0x7E3: return "IMCU";
+    case 0x7E4: return "CCU";
+    case 0x7E5: return "BMS";
+    default:    return "UNKNOWN";
+    }
+}
 
 /* Send one Service 22 request and assemble the reply, handling ISO-TP framing:
  * single frame, or first frame -> flow control -> consecutive frames. Returns
@@ -353,43 +398,682 @@ static void log_payload(const uint8_t *d, int n)
              (n > 32) ? " (truncated)" : "");
 }
 
+/* ============================== Web dashboard ============================= */
+#if RUN_MODE == MODE_DASH
+
+/* Rendering form for values that are not a plain scaled number. */
+typedef enum { FMT_NUM, FMT_BMS_STATUS, FMT_CELLGROUP, FMT_REGEN } pid_fmt_t;
+
+typedef struct {
+    const char *name;
+    const char *group;      /* dashboard tab                                  */
+    uint16_t    req_id, resp_id;
+    uint8_t     did_hi, did_lo;
+    uint8_t     nbytes;     /* data bytes consumed, big-endian (1-4)          */
+    float       scale, offset;   /* value = raw * scale + offset              */
+    int         dec;
+    const char *unit;
+    pid_fmt_t   fmt;
+    bool        testing;    /* unverified -> shown with a "test" tag          */
+} pid_desc_t;
+
+/* Ported from firmware/poc4_idf_decode with the corrections the car has since
+ * taught us (notes 10 and 12):
+ *   - the ten MG-inherited DIDs that do not exist on MAXUS are gone
+ *   - the six sentinel DIDs (3FFF / FFFE) are gone - they answer, but the
+ *     payload means "no data", so any decoded number is meaningless
+ *   - the motor PIDs lost their `testing` tag (proven by the idle->driving delta)
+ *   - the per-cell module groups are new: single-frame, 12 of them, stride 8
+ * Formulas: docs/findings/01-confirmed-pids.md and src/pids.py. */
+static const pid_desc_t PIDS[] = {
+    /* ---------- BMS 7E5 - confirmed ---------- */
+    {"Bus Voltage",  "BMS", 0x7E5,0x7ED, 0xB0,0x41, 2, 0.25f,     0.0f, 1, "V", FMT_NUM, false},
+    {"Pack Voltage", "BMS", 0x7E5,0x7ED, 0xB0,0x42, 2, 0.25f,     0.0f, 1, "V", FMT_NUM, false},
+    {"Pack Current", "BMS", 0x7E5,0x7ED, 0xB0,0x43, 2, 0.025f, -1000.0f, 1, "A", FMT_NUM, false},
+    {"SOC Raw",      "BMS", 0x7E5,0x7ED, 0xB0,0x46, 2, 0.1f,      0.0f, 1, "%", FMT_NUM, false},
+    {"Cell V Max",   "BMS", 0x7E5,0x7ED, 0xB0,0x58, 2, 0.001f,    0.0f, 3, "V", FMT_NUM, false},
+    {"Cell V Min",   "BMS", 0x7E5,0x7ED, 0xB0,0x59, 2, 0.001f,    0.0f, 3, "V", FMT_NUM, false},
+    {"Batt Temp Hi", "BMS", 0x7E5,0x7ED, 0xB0,0x56, 1, 0.5f,    -40.0f, 1, "C", FMT_NUM, false},
+    {"Batt Temp Lo", "BMS", 0x7E5,0x7ED, 0xB0,0x57, 1, 0.5f,    -40.0f, 1, "C", FMT_NUM, false},
+    {"Charge Status","BMS", 0x7E5,0x7ED, 0xB0,0x48, 1, 0.0f,      0.0f, 0, "",  FMT_BMS_STATUS, false},
+    /* ---------- BMS 7E5 - still testing ---------- */
+    {"SOH",          "BMS", 0x7E5,0x7ED, 0xB0,0x61, 2, 0.01f,     0.0f, 1, "%", FMT_NUM, true},
+    {"Coolant",      "BMS", 0x7E5,0x7ED, 0xB0,0x5C, 1, 0.5f,    -40.0f, 1, "C", FMT_NUM, true},
+
+    /* ---------- Motor / IMCU 7E3 - confirmed by idle->driving delta ---------- */
+    {"Motor Temp",   "Motor", 0x7E3,0x7EB, 0xB4,0x05, 1, 1.0f,   -40.0f, 0, "C",   FMT_NUM, false},
+    {"Motor Speed",  "Motor", 0x7E3,0x7EB, 0xB4,0x02, 2, 1.0f, -32767.0f, 0, "rpm", FMT_NUM, false},
+    {"Motor Torque", "Motor", 0x7E3,0x7EB, 0xB4,0x01, 2, 1.0f, -32767.0f, 0, "",    FMT_NUM, false},
+    /* H3, the project's primary goal. Found by diffing full DID scans taken at
+     * regen Low / Medium / High: the only DID of 309 that stepped 00 -> 01 -> 02
+     * in selector order. Confirmed live by predicting the level from the raw
+     * value before being told (docs/findings/13-regen-level-found.md). */
+    {"Regen Level",  "Motor", 0x7E3,0x7EB, 0xB4,0x80, 1, 0.0f,      0.0f, 0, "",    FMT_REGEN, false},
+
+    /* ---------- Vehicle - IMCU 7E3 ---------- */
+    {"12V Battery",  "Vehicle", 0x7E3,0x7EB, 0x01,0x12, 1, 1.0f, 0.0f, 1, "V",  FMT_NUM, false},
+    {"Odometer",     "Vehicle", 0x7E3,0x7EB, 0xE1,0x01, 3, 1.0f, 0.0f, 0, "km", FMT_NUM, false},
+
+    /* ---------- Cells: 12 module groups, 7 bytes each (note 12) ----------
+     * Layout {Va_hi,Va_lo, Vb_hi,Vb_lo, Ta, Tb, ?}; MG formulas
+     * V = INT16/2000 + 1.0 and T = byte*0.5 - 40 reproduce the pack state.
+     * Still `testing`: the formulas come from the MG reference, not our car. */
+    {"Module 1",  "Cells", 0x7E5,0x7ED, 0xB0,0x01, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 2",  "Cells", 0x7E5,0x7ED, 0xB0,0x09, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 3",  "Cells", 0x7E5,0x7ED, 0xB0,0x11, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 4",  "Cells", 0x7E5,0x7ED, 0xB0,0x19, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 5",  "Cells", 0x7E5,0x7ED, 0xB0,0x21, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 6",  "Cells", 0x7E5,0x7ED, 0xB0,0x29, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 7",  "Cells", 0x7E5,0x7ED, 0xB0,0xA3, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 8",  "Cells", 0x7E5,0x7ED, 0xB0,0xAB, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 9",  "Cells", 0x7E5,0x7ED, 0xB0,0xB3, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 10", "Cells", 0x7E5,0x7ED, 0xB0,0xBB, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 11", "Cells", 0x7E5,0x7ED, 0xB0,0xC3, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+    {"Module 12", "Cells", 0x7E5,0x7ED, 0xB0,0xCB, 7, 0,0, 0, "", FMT_CELLGROUP, true},
+
+    /* ---------- Identification (read once, but cheap enough to keep) ---------- */
+    {"VIN",         "Info", 0x7E3,0x7EB, 0xF1,0x90, 0, 0,0, 0, "", FMT_NUM, false},
+    {"BMS Version", "Info", 0x7E5,0x7ED, 0xF1,0x94, 0, 0,0, 0, "", FMT_NUM, false},
+};
+#define N_PIDS (sizeof(PIDS) / sizeof(PIDS[0]))
+
+/* B048 BMS-status enum, verbatim from note 07 (MG firmware); 03 seen live. */
+static const char *b048_enum(int v)
+{
+    switch (v) {
+    case 0x00: return "Connected, not charging";
+    case 0x01: return "Idle";
+    case 0x03: return "Running";
+    case 0x06: return "Charging (AC)";
+    case 0x07: return "Charging (DC)";
+    case 0x08: return "About to sleep";
+    case 0x0a: return "Connected";
+    case 0x0c: return "Starting charge";
+    default:   return "?";
+    }
+}
+
+/* --- Shared snapshot: one rendered value per PID, guarded by a mutex --- */
+typedef struct {
+    bool valid;
+    char text[48];
+    char raw[40];
+} pid_val_t;
+
+static SemaphoreHandle_t s_snap_mutex;
+static pid_val_t g_vals[N_PIDS];
+static uint32_t  g_seq;
+static char      g_sta_ip[16] = "-";
+
+/* Serialises TWAI access between the dashboard poller and the scan task, and
+ * the flag the poller watches so it stands down for the duration of a scan.
+ * Declared here because the poller (below) is defined before the scan code. */
+static SemaphoreHandle_t s_bus_mutex;
+static volatile bool     s_scan_active;
+
+/* Render one reply into `out`. `d` points at the payload after 62 <did><did>. */
+static void render(const pid_desc_t *p, const uint8_t *d, int n, pid_val_t *out)
+{
+    size_t o = 0;
+    for (int i = 0; i < n && o + 2 < sizeof(out->raw); i++)
+        o += snprintf(out->raw + o, sizeof(out->raw) - o, "%02X", d[i]);
+
+    if (p->nbytes == 0) {                       /* ASCII identification value */
+        int m = (n < (int)sizeof(out->text) - 1) ? n : (int)sizeof(out->text) - 1;
+        for (int i = 0; i < m; i++)
+            out->text[i] = (d[i] >= 0x20 && d[i] < 0x7F) ? (char)d[i] : '.';
+        out->text[m] = '\0';
+        return;
+    }
+
+    if (p->fmt == FMT_CELLGROUP) {
+        float va = ((d[0] << 8 | d[1]) / 2000.0f) + 1.0f;
+        float vb = ((d[2] << 8 | d[3]) / 2000.0f) + 1.0f;
+        snprintf(out->text, sizeof(out->text), "%.3f/%.3f V  %.1f/%.1f C",
+                 va, vb, d[4] * 0.5f - 40.0f, d[5] * 0.5f - 40.0f);
+        return;
+    }
+
+    uint32_t raw = 0;
+    for (int b = 0; b < p->nbytes; b++) raw = (raw << 8) | d[b];
+
+    if (p->fmt == FMT_REGEN) {
+        static const char *lv[] = {"Low", "Medium", "High"};
+        snprintf(out->text, sizeof(out->text), "%s (%02X)",
+                 raw < 3 ? lv[raw] : "?", (unsigned)raw);
+    }
+    else if (p->fmt == FMT_BMS_STATUS)
+        snprintf(out->text, sizeof(out->text), "%s (%02X)", b048_enum((int)raw), (unsigned)raw);
+    else
+        snprintf(out->text, sizeof(out->text), "%.*f %s", p->dec,
+                 raw * p->scale + p->offset, p->unit);
+}
+
+/* Poll the table forever. Each PID is written into the snapshot under a brief
+ * lock of its own rather than building a full copy on the stack - the same
+ * lesson the report_task stack overflow taught us. */
+static void dash_poll_task(void *arg)
+{
+    uint8_t buf[UDS_BUF];
+
+    while (1) {
+        /* A scan owns the bus for minutes at a time; stand down rather than
+         * interleaving 30 PID reads with it. Values simply hold their last
+         * reading until the scan finishes. */
+        if (s_scan_active) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        int ok = 0;
+        for (size_t i = 0; i < N_PIDS; i++) {
+            const pid_desc_t *p = &PIDS[i];
+            pid_val_t v = { .valid = false, .text = "--", .raw = "" };
+
+            xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+            int n = uds_xfer(p->req_id, p->resp_id, p->did_hi, p->did_lo,
+                             buf, sizeof(buf), NULL, 200, false);
+            xSemaphoreGive(s_bus_mutex);
+            /* Need a positive response for the DID we asked for, long enough
+             * for this descriptor. */
+            if (n >= 3 && buf[0] == 0x62 && buf[1] == p->did_hi && buf[2] == p->did_lo
+                && (n - 3) >= p->nbytes) {
+                v.valid = true;
+                render(p, buf + 3, n - 3, &v);
+                ok++;
+            }
+
+            xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
+            g_vals[i] = v;
+            xSemaphoreGive(s_snap_mutex);
+        }
+
+        xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
+        g_seq++;
+        uint32_t seq = g_seq;
+        xSemaphoreGive(s_snap_mutex);
+
+        ESP_LOGI(TAG, "[poll #%lu] %d/%d ok | heap=%lu", (unsigned long)seq,
+                 ok, (int)N_PIDS, (unsigned long)esp_get_free_heap_size());
+
+        /* Nobody answering means nobody will answer sooner by asking again fast
+         * - wait longer to avoid pointless transmit spam. Once PIDs are
+         * answering, a full cycle already takes ~0.6 s at ~10 ms/PID, so there
+         * is no need to re-poll immediately either; the dashboard only needs to
+         * feel live, not sub-second. */
+        vTaskDelay(pdMS_TO_TICKS(ok > 0 ? 1000 : 2000));
+    }
+}
+
+/* ---------------------- Scan over WiFi (no laptop) --------------------- *
+ * The board lives in the car; the whole point is to trigger a full DID sweep
+ * and collect the result without a USB cable. Results accumulate in a heap
+ * buffer and are downloaded afterwards from /scan/result.
+ *
+ * This is the tool the regen hunt (H3, the primary goal) needs: scan at regen
+ * Low, at Medium, at High, then diff the three files. */
+
+#define SCAN_BUF_CAP  (96 * 1024)   /* ~1824 hit lines at ~28 bytes, plus slack */
+
+typedef enum { SCAN_IDLE, SCAN_RUNNING, SCAN_DONE, SCAN_FAILED } scan_state_t;
+
+static volatile scan_state_t s_scan_state = SCAN_IDLE;
+static char  *s_scan_buf;
+static size_t s_scan_len;
+static int    s_scan_pct;
+static int    s_scan_found;
+static char   s_scan_cur[32] = "";
+static uint32_t s_scan_ecus[SCAN_MAX_ECUS]; /* request ids selected by the caller */
+static int    s_scan_n_ecus;
+
+static void sbuf(const char *fmt, ...)
+{
+    if (!s_scan_buf || s_scan_len + 128 >= SCAN_BUF_CAP) return;
+    va_list ap;
+    va_start(ap, fmt);
+    s_scan_len += vsnprintf(s_scan_buf + s_scan_len, SCAN_BUF_CAP - s_scan_len, fmt, ap);
+    va_end(ap);
+}
+
+static void scan_task(void *arg)
+{
+    uint8_t buf[UDS_BUF];
+    uint32_t resp_of[SCAN_MAX_ECUS];
+    int n_ecus = 0;
+
+    s_scan_len   = 0;
+    s_scan_found = 0;
+    s_scan_pct   = 0;
+    s_scan_state = SCAN_RUNNING;
+
+    sbuf("# poc5 scan over WiFi\n");
+
+    /* ---- Phase A: which of the requested addresses answer? ---- */
+    strcpy(s_scan_cur, "discovering");
+    for (int i = 0; i < s_scan_n_ecus; i++) {
+        uint32_t id = s_scan_ecus[i], from = 0;
+        xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+        int n = uds_xfer(id, 0, 0xF1, 0x90, buf, sizeof(buf), &from, 60, false);
+        xSemaphoreGive(s_bus_mutex);
+        if (n < 0) continue;
+        sbuf("[ECU] req=%03X resp=%03X %s\n", (unsigned)id, (unsigned)from, ecu_name(id));
+        s_scan_ecus[n_ecus] = id;
+        resp_of[n_ecus++]   = from;
+    }
+    sbuf("# %d ECU(s) responding\n", n_ecus);
+
+    if (n_ecus == 0) {
+        sbuf("# no ECU answered - is the vehicle READY?\n");
+        s_scan_state = SCAN_FAILED;
+        s_scan_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* ---- Phase B: sweep the DID pages on each responding ECU ---- */
+    const long total = (long)n_ecus * N_DID_RANGES * 256;
+    long done = 0;
+
+    for (int e = 0; e < n_ecus; e++) {
+        uint32_t req = s_scan_ecus[e], resp = resp_of[e];
+        sbuf("# ECU %03X (%s)\n", (unsigned)req, ecu_name(req));
+        int found = 0;
+
+        for (size_t r = 0; r < N_DID_RANGES; r++) {
+            for (uint32_t did = DID_RANGES[r].lo; did <= DID_RANGES[r].hi; did++) {
+                snprintf(s_scan_cur, sizeof(s_scan_cur), "%03X %04X",
+                         (unsigned)req, (unsigned)did);
+
+                xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+                int n = uds_xfer(req, resp, (did >> 8) & 0xFF, did & 0xFF,
+                                 buf, sizeof(buf), NULL, 60, false);
+                xSemaphoreGive(s_bus_mutex);
+
+                if (++done % 64 == 0) s_scan_pct = (int)(done * 100 / total);
+
+                if (n < 0) continue;
+                if (n >= 3 && buf[0] == 0x7F) {
+                    /* NRC 0x31 just means "no such DID" and would swamp the
+                     * output; anything else is worth recording. */
+                    if (buf[2] != 0x31)
+                        sbuf("[%03X] %04X NRC %02X\n", (unsigned)req, (unsigned)did, buf[2]);
+                    continue;
+                }
+                if (n >= 3 && buf[0] == 0x62) {
+                    found++; s_scan_found++;
+                    sbuf("[%03X] %04X + %2d : ", (unsigned)req, (unsigned)did, n - 3);
+                    for (int i = 3; i < n && i < 3 + 24; i++) sbuf("%02X ", buf[i]);
+                    sbuf("\n");
+                }
+            }
+        }
+        sbuf("# ECU %03X: %d supported\n", (unsigned)req, found);
+    }
+
+    s_scan_pct = 100;
+    strcpy(s_scan_cur, "done");
+    sbuf("# SCAN COMPLETE - %d DIDs\n", s_scan_found);
+    s_scan_state  = SCAN_DONE;
+    s_scan_active = false;
+    ESP_LOGI(TAG, "scan complete: %d DIDs, %u bytes", s_scan_found, (unsigned)s_scan_len);
+    vTaskDelete(NULL);
+}
+
+/* GET /scan/start?ecus=7E3,7E4   (or ?ecus=all for the whole 0x700-0x7FF range)
+ * A targeted scan matters: 7E3+7E4 is ~4 minutes where all 33 ECUs is ~25, and
+ * the regen hunt needs several passes. */
+static esp_err_t scan_start_handler(httpd_req_t *req)
+{
+    if (s_scan_state == SCAN_RUNNING) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "scan already running");
+    }
+
+    char q[128] = "", val[96] = "7E3,7E4";
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
+        httpd_query_key_value(q, "ecus", val, sizeof(val));
+
+    s_scan_n_ecus = 0;
+    if (strcmp(val, "all") == 0) {
+        for (uint32_t id = SCAN_REQ_LO; id <= SCAN_REQ_HI && s_scan_n_ecus < SCAN_MAX_ECUS; id++)
+            s_scan_ecus[s_scan_n_ecus++] = id;
+    } else {
+        for (char *t = strtok(val, ","); t && s_scan_n_ecus < SCAN_MAX_ECUS;
+             t = strtok(NULL, ",")) {
+            uint32_t id = (uint32_t)strtol(t, NULL, 16);
+            if (id >= SCAN_REQ_LO && id <= SCAN_REQ_HI) s_scan_ecus[s_scan_n_ecus++] = id;
+        }
+    }
+    if (s_scan_n_ecus == 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "no valid ECU ids (must be 700-7FF)");
+    }
+
+    if (!s_scan_buf) s_scan_buf = heap_caps_malloc(SCAN_BUF_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_scan_buf) s_scan_buf = malloc(SCAN_BUF_CAP);
+    if (!s_scan_buf) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "out of memory for the scan buffer");
+    }
+
+    s_scan_active = true;            /* dashboard poller stands down */
+    xTaskCreate(scan_task, "scan", 8192, NULL, 5, NULL);
+
+    char msg[64];
+    int n = snprintf(msg, sizeof(msg), "scan started on %d ECU(s)", s_scan_n_ecus);
+    return httpd_resp_send(req, msg, n);
+}
+
+static esp_err_t scan_status_handler(httpd_req_t *req)
+{
+    static const char *names[] = {"idle", "running", "done", "failed"};
+    char j[192];
+    int n = snprintf(j, sizeof(j),
+                     "{\"state\":\"%s\",\"pct\":%d,\"found\":%d,\"at\":\"%s\",\"bytes\":%u}",
+                     names[s_scan_state], s_scan_pct, s_scan_found, s_scan_cur,
+                     (unsigned)s_scan_len);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, j, n);
+}
+
+static esp_err_t scan_result_handler(httpd_req_t *req)
+{
+    if (!s_scan_buf || s_scan_len == 0)
+        return httpd_resp_sendstr(req, "# no scan result yet\n");
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    /* Sent in chunks - the buffer is far larger than one response allows. */
+    size_t off = 0;
+    while (off < s_scan_len) {
+        size_t c = s_scan_len - off;
+        if (c > 4096) c = 4096;
+        if (httpd_resp_send_chunk(req, s_scan_buf + off, c) != ESP_OK) return ESP_FAIL;
+        off += c;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* -------------------------- OTA firmware update ----------------------- *
+ * POST the new .bin here and the board reboots into it. This is what makes the
+ * cable optional from now on:
+ *     curl --data-binary @build/poc5_s3_can.bin http://maxus.local/update  */
+static esp_err_t update_post_handler(httpd_req_t *req)
+{
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "no OTA partition");
+    }
+    ESP_LOGW(TAG, "OTA: receiving %d bytes -> %s", req->content_len, part->label);
+
+    esp_ota_handle_t h = 0;
+    if (esp_ota_begin(part, OTA_SIZE_UNKNOWN, &h) != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "esp_ota_begin failed");
+    }
+
+    char *buf = malloc(2048);
+    if (!buf) { esp_ota_abort(h); return ESP_FAIL; }
+
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int r = httpd_req_recv(req, buf, remaining > 2048 ? 2048 : remaining);
+        if (r <= 0) {
+            free(buf); esp_ota_abort(h);
+            ESP_LOGE(TAG, "OTA: receive failed with %d bytes left", remaining);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "upload interrupted");
+        }
+        if (esp_ota_write(h, buf, r) != ESP_OK) {
+            free(buf); esp_ota_abort(h);
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            return httpd_resp_sendstr(req, "esp_ota_write failed");
+        }
+        remaining -= r;
+    }
+    free(buf);
+
+    if (esp_ota_end(h) != ESP_OK || esp_ota_set_boot_partition(part) != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "image invalid - not switching");
+    }
+
+    httpd_resp_sendstr(req, "OK - rebooting into the new image\n");
+    ESP_LOGW(TAG, "OTA ok, rebooting into %s", part->label);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* ------------------------------- HTTP -------------------------------- */
+
+static esp_err_t data_get_handler(httpd_req_t *req)
+{
+    static char json[6144];
+    int o = 0;
+
+    xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
+    o += snprintf(json + o, sizeof(json) - o,
+                  "{\"seq\":%lu,\"ip\":\"%s\",\"pids\":[", (unsigned long)g_seq, g_sta_ip);
+    for (size_t i = 0; i < N_PIDS; i++) {
+        o += snprintf(json + o, sizeof(json) - o,
+                      "%s{\"n\":\"%s\",\"g\":\"%s\",\"v\":\"%s\",\"r\":\"%s\",\"t\":%d}",
+                      i ? "," : "", PIDS[i].name, PIDS[i].group,
+                      g_vals[i].text, g_vals[i].raw, PIDS[i].testing ? 1 : 0);
+    }
+    o += snprintf(json + o, sizeof(json) - o, "]}");
+    xSemaphoreGive(s_snap_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json, o);
+}
+
+static const char HTML_PAGE[] =
+"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>MAXUS 9 EV</title><style>"
+"body{margin:0;padding:12px 12px 72px;background:#111;color:#eee;"
+"font:16px system-ui,-apple-system,sans-serif}"
+"h1{font-size:20px;text-align:center;margin:6px 0 14px}"
+"table{width:100%;border-collapse:collapse}"
+"td{padding:11px 4px;border-bottom:1px solid #282828}"
+"td.v{text-align:right;color:#4da3ff;font-weight:600;white-space:nowrap}"
+"td.r{text-align:right;color:#555;font:12px ui-monospace,monospace;width:1%;"
+"padding-left:10px;white-space:nowrap}"
+".tag{background:#5a4300;color:#ffc107;font-size:11px;padding:1px 6px;"
+"border-radius:8px;margin-left:6px;vertical-align:middle}"
+"#foot{text-align:center;color:#777;font-size:13px;margin-top:14px}"
+"#tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:#181818;"
+"border-top:1px solid #2c2c2c}"
+"#tabs button{flex:1;padding:14px 4px;background:none;border:none;color:#888;"
+"font-size:15px;border-top:3px solid transparent}"
+"#tabs button.on{color:#4da3ff;border-top-color:#4da3ff}"
+"#scan{display:none}#scan button{background:#4da3ff;color:#000;border:none;"
+"padding:12px 18px;border-radius:8px;font-size:15px;font-weight:600;margin:4px}"
+"#scan input{background:#222;color:#eee;border:1px solid #444;border-radius:6px;"
+"padding:10px;font-size:15px;width:60%}"
+"#bar{height:8px;background:#282828;border-radius:4px;margin:14px 0}"
+"#bar>div{height:100%;width:0;background:#4da3ff;border-radius:4px}"
+"#slog{color:#888;font:13px ui-monospace,monospace;white-space:pre-wrap}"
+"</style><h1>MAXUS 9 EV</h1><table id=t></table>"
+"<div id=scan><p>ECUs (hex, comma separated, or <b>all</b>):</p>"
+"<input id=ecus value='7E3,7E4'><p>"
+"<button onclick='startScan()'>Start scan</button>"
+"<button onclick=\"location.href='/scan/result'\">Download result</button></p>"
+"<div id=bar><div></div></div><div id=slog>idle</div></div>"
+"<div id=foot>connecting...</div>"
+"<div id=tabs></div><script>"
+"let tab=localStorage.getItem('tab')||'';"
+"async function startScan(){"
+" const e=document.getElementById('ecus').value;"
+" document.getElementById('slog').textContent="
+"  await(await fetch('/scan/start?ecus='+encodeURIComponent(e))).text();"
+"}"
+"async function scanTick(){"
+" let s;try{s=await(await fetch('/scan/status')).json()}catch(e){return}"
+" document.querySelector('#bar>div').style.width=s.pct+'%';"
+" document.getElementById('slog').textContent="
+"  s.state+'  '+s.pct+'%  found '+s.found+'  '+s.at+'  ('+s.bytes+' bytes)';"
+"}"
+"async function tick(){"
+" if(tab=='Scan'){scanTick()}"
+" let d;try{d=await(await fetch('/data')).json()}catch(e){"
+"  document.getElementById('foot').textContent='offline';return}"
+" const gs=[...new Set(d.pids.map(p=>p.g))].concat(['Scan']);"
+" if(!gs.includes(tab))tab=gs[0];"
+" const tb=document.getElementById('tabs');"
+" if(tb.childElementCount!=gs.length){tb.innerHTML='';gs.forEach(g=>{"
+"  const b=document.createElement('button');b.textContent=g;"
+"  b.onclick=()=>{tab=g;localStorage.setItem('tab',g);tick()};tb.appendChild(b)})}"
+" [...tb.children].forEach(b=>b.className=b.textContent==tab?'on':'');"
+" const isScan=tab=='Scan';"
+" document.getElementById('scan').style.display=isScan?'block':'none';"
+" document.getElementById('t').style.display=isScan?'none':'table';"
+" document.getElementById('t').innerHTML=d.pids.filter(p=>p.g==tab).map(p=>"
+"  `<tr><td>${p.n}${p.t?'<span class=tag>test</span>':''}</td>"
+"   <td class=v>${p.v}</td><td class=r>${p.r}</td></tr>`).join('');"
+" document.getElementById('foot').textContent="
+"  'poll #'+d.seq+(d.ip!='-'?' \\u00b7 '+d.ip:'');"
+"}"
+"tick();setInterval(tick,1000);</script>";
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+static void http_start(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 8;
+    cfg.stack_size       = 8192;   /* OTA writes flash from the handler task */
+    cfg.recv_wait_timeout = 20;    /* an OTA upload is bigger than a page GET */
+    cfg.send_wait_timeout  = 20;
+
+    httpd_handle_t srv = NULL;
+    if (httpd_start(&srv, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server failed to start");
+        return;
+    }
+    httpd_uri_t routes[] = {
+        {.uri = "/",             .method = HTTP_GET,  .handler = root_get_handler},
+        {.uri = "/data",         .method = HTTP_GET,  .handler = data_get_handler},
+        {.uri = "/scan/start",   .method = HTTP_GET,  .handler = scan_start_handler},
+        {.uri = "/scan/status",  .method = HTTP_GET,  .handler = scan_status_handler},
+        {.uri = "/scan/result",  .method = HTTP_GET,  .handler = scan_result_handler},
+        {.uri = "/update",       .method = HTTP_POST, .handler = update_post_handler},
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
+        httpd_register_uri_handler(srv, &routes[i]);
+
+    ESP_LOGI(TAG, "HTTP up: / /data /scan/start /scan/status /scan/result /update");
+}
+
+/* ------------------------------- WiFi -------------------------------- */
+
+static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* Keep trying: the router may be out of range (in the car) or rebooting.
+         * The AP interface stays up regardless, so the dashboard never dies. */
+        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        strcpy(g_sta_ip, "-");
+        ESP_LOGW(TAG, "STA disconnected (reason=%d) - retrying '%s'", e->reason, STA_SSID);
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        snprintf(g_sta_ip, sizeof(g_sta_ip), IPSTR, IP2STR(&e->ip_info.ip));
+        ESP_LOGI(TAG, "STA joined '%s' -> http://%s/  (or http://" MDNS_HOST ".local/)",
+                 STA_SSID, g_sta_ip);
+    }
+}
+
+/* APSTA on purpose: joining the home router is what lets a PC on the LAN (and
+ * the analysis scripts) reach the board, but the router is not in range once
+ * the car leaves - so the board's own AP stays up at the same time. */
+static void wifi_init_apsta(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_evt, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_evt, NULL, NULL));
+
+    wifi_config_t ap = {0};
+    strncpy((char *)ap.ap.ssid, AP_SSID, sizeof(ap.ap.ssid));
+    strncpy((char *)ap.ap.password, AP_PASS, sizeof(ap.ap.password));
+    ap.ap.ssid_len       = strlen(AP_SSID);
+    ap.ap.channel        = 1;
+    ap.ap.max_connection = 4;
+    ap.ap.authmode       = strlen(AP_PASS) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+
+    if (STA_SSID[0]) {
+        wifi_config_t sta = {0};
+        strncpy((char *)sta.sta.ssid, STA_SSID, sizeof(sta.sta.ssid));
+        strncpy((char *)sta.sta.password, STA_PASS, sizeof(sta.sta.password));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+    if (STA_SSID[0]) esp_wifi_connect();
+
+    ESP_LOGI(TAG, "AP '%s' up at 192.168.4.1", AP_SSID);
+}
+
+static void mdns_start(void)
+{
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS init failed - reach the board by IP instead");
+        return;
+    }
+    mdns_hostname_set(MDNS_HOST);
+    mdns_instance_name_set("MAXUS 9 EV bridge");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS: http://" MDNS_HOST ".local/");
+}
+
+static void run_dashboard(void)
+{
+    ESP_LOGI(TAG, "*** DASHBOARD MODE - Service 22 reads, WiFi APSTA ***");
+
+    s_snap_mutex = xSemaphoreCreateMutex();
+    s_bus_mutex  = xSemaphoreCreateMutex();
+    if (!s_snap_mutex || !s_bus_mutex) { ESP_LOGE(TAG, "mutex alloc failed"); return; }
+    for (size_t i = 0; i < N_PIDS; i++) strcpy(g_vals[i].text, "--");
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+    wifi_init_apsta();
+    mdns_start();
+    http_start();
+
+    twai_timing_config_t t = BITRATES[0].timing;   /* 500k */
+    if (twai_bring_up(TWAI_MODE_NORMAL, &t) != ESP_OK) {
+        ESP_LOGE(TAG, "TWAI bring-up failed");
+        return;
+    }
+    ESP_LOGI(TAG, "Polling %d PIDs", (int)N_PIDS);
+    xTaskCreate(dash_poll_task, "dash_poll", 6144, NULL, 5, NULL);
+}
+
+#endif /* MODE_DASH */
+
 /* ============================== ECU / DID scan ============================ */
 #if RUN_MODE == MODE_SCAN
-
-/* Diagnostic request range. Hard limit - see the guard in uds_xfer(). */
-#define SCAN_REQ_LO   0x700
-#define SCAN_REQ_HI   0x7FF
-
-/* This vehicle answers on far more addresses than the three the ELM327 path
- * knew about (33 found on the first run), so the table has to be generous. */
-#define SCAN_MAX_ECUS   48
 
 /* Phase B sweeps only ECUs at or above this address. Phase A always reports the
  * full map. Set it to resume a scan that was split across runs instead of
  * re-sweeping addresses already covered. */
-#define SCAN_SWEEP_FROM 0x73E
-
-/* DID blocks worth sweeping. The B0/B3/B4/B7/B9/BA pages are where every PID we
- * have confirmed so far lives (docs/findings/09-ovms-cross-reference.md); F1 is
- * the standard identification page; 00 is the generic OBD page. */
-static const struct { uint16_t lo, hi; } DID_RANGES[] = {
-    { 0xB000, 0xB0FF }, { 0xB300, 0xB3FF }, { 0xB400, 0xB4FF },
-    { 0xB700, 0xB7FF }, { 0xB900, 0xB9FF }, { 0xBA00, 0xBAFF },
-    { 0xF100, 0xF1FF }, { 0x0000, 0x00FF },
-};
-#define N_DID_RANGES (sizeof(DID_RANGES) / sizeof(DID_RANGES[0]))
-
-/* Friendly names for the ECUs we already identified on the ELM327 path
- * (docs/findings/01-confirmed-pids.md). Unknown ones are reported by address. */
-static const char *ecu_name(uint32_t req_id)
-{
-    switch (req_id) {
-    case 0x7E3: return "VCU";
-    case 0x7E4: return "GATEWAY";
-    case 0x7E5: return "BMS";
-    default:    return "UNKNOWN";
-    }
-}
+#define SCAN_SWEEP_FROM 0x700
 
 static void run_scan(void)
 {
@@ -708,6 +1392,8 @@ void app_main(void)
     run_active_uds();   /* never returns */
 #elif RUN_MODE == MODE_SCAN
     run_scan();         /* never returns */
+#elif RUN_MODE == MODE_DASH
+    run_dashboard();    /* starts tasks and returns */
 #else
     ESP_LOGI(TAG, "Mode: LISTEN_ONLY (cannot transmit or ACK - vehicle safe)");
 

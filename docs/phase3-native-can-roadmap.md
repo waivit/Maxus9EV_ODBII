@@ -128,7 +128,28 @@ Consequences for this roadmap:
 - **Impact:** `F194` is the value the MAXUS Display-SOC transform is keyed on — this is
   what finally **locks H1** (see `10-poc4-live-crosscheck.md`).
 
-## Step 4 — Passive sniffing / broadcast-frame discovery
+## Step 4b — Regen-level hunt via state diff  ⭐ **PRIMARY PROJECT GOAL**
+*Replaces Step 4 for the regen objective, since passive sniffing is unavailable here.*
+- **Goal:** find the DID that holds the **regenerative braking level** (High /
+  Medium / Low) — **H3**, the project's primary goal.
+- **Why this works where sniffing does not:** regen level is a *driver-selected
+  setting*, so an ECU must store it, and stored settings are what Service 22 reads.
+  The gateway blocks broadcast traffic, not requests.
+- **Method:** run the `MODE_SCAN` sweep three times with the vehicle otherwise
+  identical (parked, READY, similar SOC), changing only the regen setting:
+  **Low → Medium → High**. Then
+  `python tools/analyze_scan.py diff low.log high.log` to get candidates, and use
+  the **Medium** capture to discard anything that does not step in order.
+- **Control for drift:** voltages, temperatures and counters move on their own, so
+  a two-way diff returns noise as well as signal. A genuine 3-position setting must
+  move **monotonically across all three** captures — that is the discriminator.
+- **Success:** one DID (ECU + address) that reliably tracks the regen selector,
+  re-verified by setting the level a fourth time and predicting the value.
+- **Then:** add it to the poc4/poc5 PID table and the dashboard.
+- **Needs the car**, parked and READY, for three scan passes (~12 min each).
+
+## Step 4 — Passive sniffing / broadcast-frame discovery ❌ **not possible via OBD**
+*Proven unavailable on this vehicle — kept for the record. See the Result section above.*
 - **Goal:** find data that is broadcast on the bus but not on OBD request/response.
 - **Build:** `TWAI_MODE_LISTEN_ONLY` full capture (all IDs) → log to serial (or flash);
   a `diff` of two captures at known, different SOC states (reuse the `scanner.py`

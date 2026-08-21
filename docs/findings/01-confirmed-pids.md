@@ -1,4 +1,4 @@
-# 01 — Confirmed PIDs (BMS + VCU) and the ECU map
+# 01 — Confirmed PIDs (BMS + IMCU) and the ECU map
 
 - **Date:** 2026-07-15 (migrated from earlier reverse-engineering sessions)
 - **Hypothesis under test:** — (baseline record of what is already proven)
@@ -16,10 +16,22 @@ Decoded each positive payload into a physical value.
 **ECU request → response map**
 
 ```
-Request 7E3 -> Response 7EB   (VCU  - Vehicle Control Unit)
-Request 7E4 -> Response 7EC   (Gateway ECU)
+Request 7E3 -> Response 7EB   (IMCU - Integrated Motor Control Unit)
+Request 7E4 -> Response 7EC   (CCU  - Central Control Unit / gateway)
 Request 7E5 -> Response 7ED   (BMS  - Battery Management System)
 ```
+
+> **Naming corrected 2026-08-21** (`12-ecu-identification-and-bms-structure.md`):
+> `7E3` was called "VCU" here and in notes 03/06/07/09 — a name inherited from the
+> MG cross-reference, not from this vehicle. Read via the standard ISO 14229
+> identification DIDs, `7E3` reports `F183 = "IMCU…"` / `F194 = "MIFAMCU520"`, and
+> every confirmed PID on it is motor-related. `7E4` likewise reports `CCU_S001R3`.
+> **Addresses, response ids and all formulas are unchanged — only the names were
+> wrong.** The dated notes keep their original wording as a record.
+
+There are **33 responding ECUs in total** (`0x700`–`0x7FF`), not three — see
+`11-native-can-ecu-scan.md`. The three above are simply the ones reachable and
+useful over the ELM327 path.
 
 ## Observations — confirmed working PIDs
 
@@ -34,7 +46,7 @@ Mirror of `src/pids.py` `CONFIRMED`. `INT16` = `(b[0]*256)+b[1]`.
 | Batt Temp Low | 7E5 | `22 B0 57` | b[0] / 2 − 40 | °C | |
 | Cell Voltage Max | 7E5 | `22 B0 58` | INT16 × 0.001 | V | |
 | Cell Voltage Min | 7E5 | `22 B0 59` | INT16 × 0.001 | V | |
-| 12V Battery | 7E3 | `22 01 12` | b[0] × 1.0 | V | on VCU, not BMS |
+| 12V Battery | 7E3 | `22 01 12` | b[0] × 1.0 | V | on IMCU (7E3), not BMS |
 | Charge Status | 7E5 | `22 B0 48` | b[0] | — | enum, values TBD (3 = driving?) → H4 |
 
 ## Observations — known dead ends (NRC 0x31 requestOutOfRange)

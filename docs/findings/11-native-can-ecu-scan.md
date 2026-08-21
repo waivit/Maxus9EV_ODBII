@@ -139,9 +139,12 @@ space is far richer than the ELM327 path ever suggested: the BMS alone exposes
   confirmed PID, and ISO-TP multi-frame delivers `F194` and `F190`.
 - **Step 4 (passive sniffing) is not possible via the OBD port** — proven, not
   assumed.
-- **H3 (regen level) → rejected via OBD.** It was parked pending a passive sniff;
-  that route is now closed at this connector. Reaching it requires tapping an
-  internal bus elsewhere in the vehicle, which is a different scale of work.
+- **H3 (regen level): the passive-sniff route is closed.** It was parked pending a
+  passive sniff, and this connector cannot provide one.
+  ⚠️ **Corrected 2026-08-21 — see the follow-up below.** The original wording here
+  went further and said reaching regen "requires tapping an internal bus
+  elsewhere". That was too broad: it assumed sniffing is the only route, and
+  ignores Service 22.
 - **New leads:** 12 per-cell module groups (single-frame), 1824 readable DIDs
   across 33 ECUs, `F183`/`F194` as an ECU-identification method.
 - **Known gap in our own tooling:** NRC `0x78` (responsePending) is not handled —
@@ -158,3 +161,34 @@ space is far richer than the ELM327 path ever suggested: the BMS alone exposes
 4. **SOC**: the dash only displays SOC % while charging, so the settled low-SOC
    calibration point (H1) must be captured during a charge session. `B046` read
    `0x00FA/0x00FB` = 25.0–25.1 % Raw during this session.
+
+---
+
+## Follow-up (2026-08-21) — the H3 verdict above was too broad
+
+Reading **regen level** has since been made a **primary project goal**, which
+forced a re-read of the verdict written here. Closing the *passive-sniff* route
+was correct and is unchanged. Concluding from it that regen needs an internal-bus
+tap was **not** — it silently assumed sniffing is the only way to reach the value.
+
+Regen High/Medium/Low is a **driver-selected setting**. Some ECU has to store it,
+and stored settings are exactly what **Service 22** reads. Nothing in this note's
+evidence says otherwise: the port answers requests perfectly well, and the sweep
+here found **1824 readable DIDs across 33 ECUs** — a search space that did not
+exist when H3 was first parked.
+
+**H3 is therefore reopened as `testing`**, with a concrete method rather than a
+new hardware requirement:
+1. Full DID scan with the regen level set to **Low**.
+2. Repeat at **Medium**, and again at **High** (vehicle state otherwise identical
+   — parked, READY, same SOC ballpark).
+3. `python tools/analyze_scan.py diff low.log high.log` → the changed DIDs are the
+   candidates; the middle capture then separates a real 3-position setting from
+   anything that merely drifted.
+
+This is the `scanner.py` snapshot/diff method the project has used since Phase 1,
+now applied across the whole ECU map instead of one PID range.
+
+**Caveat to control for:** many values drift on their own (voltages, temperatures,
+counters), so a single diff will return noise as well as signal. Requiring the
+candidate to move *monotonically across all three* levels is what separates them.

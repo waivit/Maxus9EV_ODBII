@@ -246,7 +246,14 @@ static const uds_probe_t PROBES[] = {
 /* Diagnostic request range. Hard limit - see the guard in uds_xfer(). */
 #define SCAN_REQ_LO   0x700
 #define SCAN_REQ_HI   0x7FF
-#define SCAN_MAX_ECUS   48
+/* Full 0x700-0x7FF diagnostic range, so ecus=all genuinely covers all of it -
+ * a 48-entry cap silently missed 7E3/7E4/7E5/7F1 (everything past 0x72F),
+ * exactly the ECUs the rest of this project depends on. Safe to raise: the
+ * only stack-local (not static) arrays sized by this constant are in
+ * run_scan(), which is `static`-qualified below specifically so this doesn't
+ * reintroduce the stack-overflow class of bug already fixed once in this file
+ * (see report_task's history). */
+#define SCAN_MAX_ECUS   256
 
 /* DID blocks worth sweeping: every PID confirmed so far lives in the B0/B3/B4/
  * B7/B9/BA pages, F1 is the standard identification page, 00 the generic OBD
@@ -1251,8 +1258,12 @@ static void run_scan(void)
         return;
     }
 
-    uint8_t  buf[UDS_BUF];
-    uint32_t ecus[SCAN_MAX_ECUS], resps[SCAN_MAX_ECUS];
+    /* static, not stack-local: run_scan() is called directly from app_main,
+     * whose task stack (CONFIG_ESP_MAIN_TASK_STACK_SIZE, 3584 bytes here) is
+     * far too small for 256-entry uint32_t arrays plus everything else this
+     * function calls into. */
+    static uint8_t  buf[UDS_BUF];
+    static uint32_t ecus[SCAN_MAX_ECUS], resps[SCAN_MAX_ECUS];
     int      n_ecus = 0;
 
     /* ---- Phase A: which addresses answer at all? -------------------------

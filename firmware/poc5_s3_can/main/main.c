@@ -241,6 +241,12 @@ static const uds_probe_t PROBES[] = {
 
 #define UDS_BUF 256
 
+/* An ECU answering NRC 0x78 (responsePending) is asking for more time, not
+ * refusing. ISO 14229 lets it extend the window to P2*_server, commonly 5 s,
+ * and repeat that; the cap stops one slow DID from stalling a 2048-DID sweep. */
+#define UDS_P2_STAR_MS   1500
+#define UDS_MAX_PENDING  4
+
 /* ---- Scan definitions, shared by MODE_SCAN (serial) and MODE_DASH (WiFi) ---- */
 
 /* Diagnostic request range. Hard limit - see the guard in uds_xfer(). */
@@ -311,7 +317,7 @@ static int uds_xfer(uint32_t req_id, uint32_t resp_id, uint8_t did_hi, uint8_t d
         return -1;
     }
 
-    int     total = -1, got = 0;
+    int     total = -1, got = 0, pending = 0;
     uint8_t next_sn = 1;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
 
@@ -338,6 +344,26 @@ static int uds_xfer(uint32_t req_id, uint32_t resp_id, uint8_t did_hi, uint8_t d
         case 0x0: {                                     /* single frame */
             int len = m.data[0] & 0x0F;
             if (len > 7) len = 7;
+
+            /* NRC 0x78 = requestCorrectlyReceived-ResponsePending: the ECU has
+             * accepted the request and is still working on it. It is NOT the
+             * final answer - treating it as one is why 11 DIDs across 7F1 and
+             * 7E3 were recorded as unreadable when the ECU was in fact about
+             * to answer (docs/findings/11-native-can-ecu-scan.md). Keep
+             * waiting, extending the deadline by P2* as ISO 14229 allows, but
+             * cap the extensions so a chatty ECU can't stall a whole scan. */
+            if (len >= 3 && m.data[1] == 0x7F && m.data[3] == 0x78) {
+                if (++pending > UDS_MAX_PENDING) {
+                    if (verbose)
+                        ESP_LOGW(TAG, "    gave up after %d x responsePending", pending);
+                    return -1;
+                }
+                if (verbose)
+                    ESP_LOGI(TAG, "    responsePending (%d) - waiting", pending);
+                deadline = esp_timer_get_time() + (int64_t)UDS_P2_STAR_MS * 1000;
+                continue;
+            }
+
             for (int i = 0; i < len && (size_t)i < out_sz; i++) out[i] = m.data[1 + i];
             return len;
         }
@@ -672,6 +698,7 @@ static const char *nrc_text(uint8_t nrc)
     case 0x22: return "conditionsNotCorrect - vehicle state blocks it";
     case 0x31: return "requestOutOfRange - value or DID not writable";
     case 0x33: return "securityAccessDenied - needs a seed/key unlock";
+    case 0x78: return "responsePending - ECU still working, not a refusal";
     case 0x7E: return "subFunctionNotSupportedInActiveSession";
     case 0x7F: return "serviceNotSupportedInActiveSession - needs 10 03 first";
     case 0x88: return "vehicleSpeedTooHigh - stop the vehicle first";

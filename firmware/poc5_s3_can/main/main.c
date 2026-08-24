@@ -602,6 +602,92 @@ static void dash_poll_task(void *arg)
     }
 }
 
+/* ------------------------- Regen level: write ------------------------- *
+ * The ONLY write this firmware can perform. Everything else is Service 22
+ * reads, and that is deliberate: a general write endpoint would put every DID
+ * on 33 ECUs one typo away from being overwritten. Here the DID is hard-coded
+ * and the value is range-checked, so the worst case is setting the regen
+ * selector to a level it already supports.
+ *
+ * Whether the ECU even accepts this is unknown - 7E3 returns NRC 0x33
+ * (securityAccessDenied) on F1A7, so a write may well be locked. The safe first
+ * test is to write back the level the car already holds: a rejection tells us it
+ * is locked, and an acceptance changes nothing.
+ *
+ * Service 2E = WriteDataByIdentifier; a positive reply is 0x6E (0x2E + 0x40). */
+#define REGEN_REQ_ID   0x7E3
+#define REGEN_RESP_ID  0x7EB
+#define REGEN_DID_HI   0xB4
+#define REGEN_DID_LO   0x80
+
+/* Writes `level` and reports what came back, verbatim, into `out`. */
+static bool regen_write(uint8_t level, char *out, size_t out_sz)
+{
+    if (level > 2) {
+        snprintf(out, out_sz, "refused: level must be 0, 1 or 2");
+        return false;
+    }
+
+    twai_message_t m;
+    while (twai_receive(&m, 0) == ESP_OK) { }        /* drop anything stale */
+
+    twai_message_t tx = {
+        .identifier       = REGEN_REQ_ID,
+        .data_length_code = 8,
+        .data = { 0x04, 0x2E, REGEN_DID_HI, REGEN_DID_LO, level,
+                  UDS_PAD, UDS_PAD, UDS_PAD },
+    };
+    if (twai_transmit(&tx, pdMS_TO_TICKS(500)) != ESP_OK) {
+        snprintf(out, out_sz, "transmit failed - nothing on the bus ACKed it");
+        return false;
+    }
+
+    int64_t deadline = esp_timer_get_time() + 2000 * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (twai_receive(&m, pdMS_TO_TICKS(100)) != ESP_OK) continue;
+        if (m.identifier != REGEN_RESP_ID) continue;
+
+        char hex[32];
+        frame_hex(m.data, m.data_length_code, hex, sizeof(hex));
+        ESP_LOGW(TAG, "regen write %u -> rx %s", level, hex);
+
+        if (m.data[1] == 0x6E && m.data[2] == REGEN_DID_HI && m.data[3] == REGEN_DID_LO) {
+            snprintf(out, out_sz, "ACCEPTED (6E B4 80) - wrote level %u", level);
+            return true;
+        }
+        if (m.data[1] == 0x7F) {
+            const char *why =
+                m.data[3] == 0x33 ? "securityAccessDenied - needs an unlock" :
+                m.data[3] == 0x22 ? "conditionsNotCorrect - vehicle state blocks it" :
+                m.data[3] == 0x31 ? "requestOutOfRange - value or DID not writable" :
+                m.data[3] == 0x7E ? "service not supported in this session" :
+                m.data[3] == 0x11 ? "service not supported at all" : "see NRC";
+            snprintf(out, out_sz, "REJECTED NRC 0x%02X - %s  [%s]", m.data[3], why, hex);
+            return false;
+        }
+        snprintf(out, out_sz, "unexpected reply: %s", hex);
+        return false;
+    }
+    snprintf(out, out_sz, "no reply within 2 s");
+    return false;
+}
+
+static esp_err_t regen_set_handler(httpd_req_t *req)
+{
+    char q[64] = "", v[8] = "";
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "level", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "usage: /regen/set?level=0|1|2");
+    }
+
+    char msg[160];
+    regen_write((uint8_t)atoi(v), msg, sizeof(msg));   /* result is in msg either way */
+    ESP_LOGW(TAG, "regen/set level=%s -> %s", v, msg);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_sendstr(req, msg);
+}
+
 /* ---------------------- Scan over WiFi (no laptop) --------------------- *
  * The board lives in the car; the whole point is to trigger a full DID sweep
  * and collect the result without a USB cable. Results accumulate in a heap
@@ -887,8 +973,9 @@ static const char HTML_PAGE[] =
 "#tabs button{flex:1;padding:14px 4px;background:none;border:none;color:#888;"
 "font-size:15px;border-top:3px solid transparent}"
 "#tabs button.on{color:#4da3ff;border-top-color:#4da3ff}"
-"#scan{display:none}#scan button{background:#4da3ff;color:#000;border:none;"
-"padding:12px 18px;border-radius:8px;font-size:15px;font-weight:600;margin:4px}"
+"#scan,#rg{display:none}#scan button,#rg button{background:#4da3ff;color:#000;"
+"border:none;padding:12px 18px;border-radius:8px;font-size:15px;font-weight:600;"
+"margin:4px}"
 "#scan input{background:#222;color:#eee;border:1px solid #444;border-radius:6px;"
 "padding:10px;font-size:15px;width:60%}"
 "#bar{height:8px;background:#282828;border-radius:4px;margin:14px 0}"
@@ -900,6 +987,13 @@ static const char HTML_PAGE[] =
 "<button onclick='startScan()'>Start scan</button>"
 "<button onclick=\"location.href='/scan/result'\">Download result</button></p>"
 "<div id=bar><div></div></div><div id=slog>idle</div></div>"
+"<div id=rg><p style='color:#888;font-size:14px'>Set regen level "
+"(writes 7E3 B480 - nothing else can be written):</p>"
+"<button onclick='setRegen(0)'>Low</button>"
+"<button onclick='setRegen(1)'>Medium</button>"
+"<button onclick='setRegen(2)'>High</button>"
+"<div id=rglog style='color:#888;font:13px ui-monospace,monospace;"
+"white-space:pre-wrap;margin-top:10px'>not tried yet</div></div>"
 "<div id=foot>connecting...</div>"
 "<div id=tabs></div><script>"
 "let tab=localStorage.getItem('tab')||'';"
@@ -907,6 +1001,11 @@ static const char HTML_PAGE[] =
 " const e=document.getElementById('ecus').value;"
 " document.getElementById('slog').textContent="
 "  await(await fetch('/scan/start?ecus='+encodeURIComponent(e))).text();"
+"}"
+"async function setRegen(l){"
+" const e=document.getElementById('rglog');e.textContent='writing '+l+' ...';"
+" try{e.textContent=await(await fetch('/regen/set?level='+l)).text()}"
+" catch(err){e.textContent='request failed: '+err}"
 "}"
 "async function scanTick(){"
 " let s;try{s=await(await fetch('/scan/status')).json()}catch(e){return}"
@@ -927,6 +1026,7 @@ static const char HTML_PAGE[] =
 " [...tb.children].forEach(b=>b.className=b.textContent==tab?'on':'');"
 " const isScan=tab=='Scan';"
 " document.getElementById('scan').style.display=isScan?'block':'none';"
+" document.getElementById('rg').style.display=tab=='Motor'?'block':'none';"
 " document.getElementById('t').style.display=isScan?'none':'table';"
 " document.getElementById('t').innerHTML=d.pids.filter(p=>p.g==tab).map(p=>"
 "  `<tr><td>${p.n}${p.t?'<span class=tag>test</span>':''}</td>"
@@ -962,6 +1062,7 @@ static void http_start(void)
         {.uri = "/scan/start",   .method = HTTP_GET,  .handler = scan_start_handler},
         {.uri = "/scan/status",  .method = HTTP_GET,  .handler = scan_status_handler},
         {.uri = "/scan/result",  .method = HTTP_GET,  .handler = scan_result_handler},
+        {.uri = "/regen/set",    .method = HTTP_GET,  .handler = regen_set_handler},
         {.uri = "/update",       .method = HTTP_POST, .handler = update_post_handler},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)

@@ -511,6 +511,17 @@ static char      g_sta_ip[16] = "-";
 static SemaphoreHandle_t s_bus_mutex;
 static volatile bool     s_scan_active;
 
+/* Idle/tab-scoped polling: set by data_get_handler on every /data request,
+ * read by dash_poll_task once per cycle. No dedicated mutex - a torn read of
+ * either is self-healing (the next 1 s tick corrects it, same tolerance
+ * already accepted for s_scan_active above), and s_active_group is always
+ * null-terminated right after writing so a torn read can't run past the
+ * buffer. Empty string means "no group filter" (poll everything), which is
+ * what a bare `curl /data` with no ?g= gets, unchanged from before this. */
+static volatile int64_t s_last_data_req_us;
+static char             s_active_group[16] = "";
+#define IDLE_TIMEOUT_US (7 * 1000 * 1000)   /* tick() polls every 1s while open */
+
 /* Render one reply into `out`. `d` points at the payload after 62 <did><did>. */
 static void render(const pid_desc_t *p, const uint8_t *d, int n, pid_val_t *out)
 {
@@ -562,9 +573,34 @@ static void dash_poll_task(void *arg)
          * reading until the scan finishes. */
         if (s_scan_active) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
 
-        int ok = 0;
+        /* Nobody has asked for /data recently -> nobody has the dashboard open
+         * -> polling the bus only burns CAN traffic and power for no reader.
+         * Stand down the same way; the very next request wakes it up again. */
+        int64_t idle_us = esp_timer_get_time() - s_last_data_req_us;
+        if (s_last_data_req_us == 0 || idle_us > IDLE_TIMEOUT_US) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        /* Snapshot once per cycle so a concurrent write from data_get_handler
+         * can't change which group this cycle is filtering on partway through. */
+        char grp[sizeof(s_active_group)];
+        strncpy(grp, s_active_group, sizeof(grp));
+        grp[sizeof(grp) - 1] = '\0';
+
+        int ok = 0, attempted = 0;
         for (size_t i = 0; i < N_PIDS; i++) {
             const pid_desc_t *p = &PIDS[i];
+
+            /* Only poll the tab that's actually open - the CAN round-trip is
+             * skipped for everything else, so its last rendered value just
+             * holds until that tab is viewed again. Empty grp (no ?g= given,
+             * e.g. a bare curl) polls everything, same as before this change.
+             * A group matching no PID (the synthetic "Scan" tab) naturally
+             * polls nothing, with no special case needed. */
+            if (grp[0] != '\0' && strcmp(p->group, grp) != 0) continue;
+            attempted++;
+
             pid_val_t v = { .valid = false, .text = "--", .raw = "" };
 
             xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
@@ -590,8 +626,9 @@ static void dash_poll_task(void *arg)
         uint32_t seq = g_seq;
         xSemaphoreGive(s_snap_mutex);
 
-        ESP_LOGI(TAG, "[poll #%lu] %d/%d ok | heap=%lu", (unsigned long)seq,
-                 ok, (int)N_PIDS, (unsigned long)esp_get_free_heap_size());
+        ESP_LOGI(TAG, "[poll #%lu] %d/%d ok | attempted=%d/%d g='%s' | heap=%lu",
+                 (unsigned long)seq, ok, attempted, attempted, (int)N_PIDS, grp,
+                 (unsigned long)esp_get_free_heap_size());
 
         /* Nobody answering means nobody will answer sooner by asking again fast
          * - wait longer to avoid pointless transmit spam. Once PIDs are
@@ -628,6 +665,14 @@ static bool regen_write(uint8_t level, char *out, size_t out_sz)
         return false;
     }
 
+    /* The only bus user in this file that used to skip s_bus_mutex.
+     * dash_poll_task polls this same DID every cycle, and both receive loops
+     * match replies by CAN id alone (no per-transaction correlation byte
+     * exists in these UDS frames), so without this lock the two could
+     * genuinely consume each other's reply frames - see
+     * docs/findings/14-regen-write-attempt.md. */
+    xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+
     twai_message_t m;
     while (twai_receive(&m, 0) == ESP_OK) { }        /* drop anything stale */
 
@@ -639,6 +684,7 @@ static bool regen_write(uint8_t level, char *out, size_t out_sz)
     };
     if (twai_transmit(&tx, pdMS_TO_TICKS(500)) != ESP_OK) {
         snprintf(out, out_sz, "transmit failed - nothing on the bus ACKed it");
+        xSemaphoreGive(s_bus_mutex);
         return false;
     }
 
@@ -653,6 +699,7 @@ static bool regen_write(uint8_t level, char *out, size_t out_sz)
 
         if (m.data[1] == 0x6E && m.data[2] == REGEN_DID_HI && m.data[3] == REGEN_DID_LO) {
             snprintf(out, out_sz, "ACCEPTED (6E B4 80) - wrote level %u", level);
+            xSemaphoreGive(s_bus_mutex);
             return true;
         }
         if (m.data[1] == 0x7F) {
@@ -660,15 +707,20 @@ static bool regen_write(uint8_t level, char *out, size_t out_sz)
                 m.data[3] == 0x33 ? "securityAccessDenied - needs an unlock" :
                 m.data[3] == 0x22 ? "conditionsNotCorrect - vehicle state blocks it" :
                 m.data[3] == 0x31 ? "requestOutOfRange - value or DID not writable" :
-                m.data[3] == 0x7E ? "service not supported in this session" :
+                m.data[3] == 0x7E ? "subFunctionNotSupportedInActiveSession" :
+                m.data[3] == 0x7F ? "serviceNotSupportedInActiveSession - needs an Extended session (10 03)" :
+                m.data[3] == 0x88 ? "vehicleSpeedTooHigh - stop the vehicle first" :
                 m.data[3] == 0x11 ? "service not supported at all" : "see NRC";
             snprintf(out, out_sz, "REJECTED NRC 0x%02X - %s  [%s]", m.data[3], why, hex);
+            xSemaphoreGive(s_bus_mutex);
             return false;
         }
         snprintf(out, out_sz, "unexpected reply: %s", hex);
+        xSemaphoreGive(s_bus_mutex);
         return false;
     }
     snprintf(out, out_sz, "no reply within 2 s");
+    xSemaphoreGive(s_bus_mutex);
     return false;
 }
 
@@ -937,6 +989,17 @@ static esp_err_t data_get_handler(httpd_req_t *req)
     static char json[6144];
     int o = 0;
 
+    /* Marks the dashboard as "someone is watching" (dash_poll_task's idle
+     * check) and tells the poller which tab to actually poll for. Absent or
+     * empty ?g= clears the filter, which is what keeps a bare curl (used
+     * throughout this project for diagnostics) refreshing every PID. */
+    s_last_data_req_us = esp_timer_get_time();
+    char q[64], g[sizeof(s_active_group)] = "";
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
+        httpd_query_key_value(q, "g", g, sizeof(g));
+    strncpy(s_active_group, g, sizeof(s_active_group));
+    s_active_group[sizeof(s_active_group) - 1] = '\0';
+
     xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
     o += snprintf(json + o, sizeof(json) - o,
                   "{\"seq\":%lu,\"ip\":\"%s\",\"pids\":[", (unsigned long)g_seq, g_sta_ip);
@@ -1015,7 +1078,7 @@ static const char HTML_PAGE[] =
 "}"
 "async function tick(){"
 " if(tab=='Scan'){scanTick()}"
-" let d;try{d=await(await fetch('/data')).json()}catch(e){"
+" let d;try{d=await(await fetch('/data?g='+encodeURIComponent(tab))).json()}catch(e){"
 "  document.getElementById('foot').textContent='offline';return}"
 " const gs=[...new Set(d.pids.map(p=>p.g))].concat(['Scan']);"
 " if(!gs.includes(tab))tab=gs[0];"

@@ -64,14 +64,40 @@ until the race that could explain it is fixed.
 - **Bug identified:** `regen_write()` missing `s_bus_mutex` — fix before any
   further live write test, since without it no result can be trusted.
 
+## Follow-up (2026-08-22) — READY-but-stationary closes the gap: `0x7F` again
+
+The missing state has been tested: **READY, parked, stationary → `0x7F`**, same
+as not-READY. Combined with the two states above, all three vehicle states are
+now covered:
+
+| State | NRC | Meaning |
+| --- | --- | --- |
+| Not READY | `0x7F` | session doesn't offer Service `2E` |
+| **READY, stationary** | **`0x7F`** | same — session, not vehicle state |
+| Moving | `0x88` | speed check, evaluated separately |
+
+This closes the gap without needing to relitigate the mutex fix's relevance
+here: `0x7F`/`0x88` are ECU-originated session/condition codes that the race
+(described above) cannot fabricate. The race could only ever cause
+`regen_write()` to receive an unrelated frame it doesn't recognize — a `0x62`
+read-reply meant for `dash_poll_task`'s own routine read of the same DID, which
+falls through to the code's "unexpected reply" branch, not a false `0x7F`. So
+this data was trustworthy independent of whether the mutex was fixed yet; what
+was genuinely missing was only the untested state itself, now filled in.
+
+**Conclusion: the write is gated purely by diagnostic session, not by vehicle
+motion.** Parked (READY or not) always hits the session gate first; moving
+substitutes a speed gate instead. No state observed so far reaches
+`0x33` (securityAccessDenied) — the write path is *closed by session*, not
+*locked by security*, as far as tested.
+
 ## Next
-1. Fix the mutex gap (mechanical — wrap `regen_write()`'s bus I/O in the same
-   `s_bus_mutex` the poller and scanner already use). Not yet applied as of this
-   note; tracked as the very next piece of work.
-2. Re-test with the fix in place, specifically the READY-but-stationary state,
-   which was never isolated cleanly from "not ready" or "moving" — that gap is
-   exactly where a clean answer is still missing.
-3. If `0x7F` persists even when stationary and READY, the next experiment is an
-   Extended Diagnostic Session (`10 03`) before the write, watching for whether
-   the rejection changes to `0x33` (securityAccessDenied — a real dead end) or
-   to acceptance.
+1. ~~Fix the mutex gap~~ — done, see the firmware commit alongside this note.
+2. **Open an Extended Diagnostic Session (`10 03`) before the write**, parked
+   and READY, with `3E 00` (TesterPresent) keeping it alive. This is the one
+   remaining untested avenue:
+   - **Accepted** → the write works; wire it up properly.
+   - **`0x33` securityAccessDenied** → a real dead end; the ECU wants a
+     manufacturer seed/key algorithm this project doesn't have.
+   - **`10 03` itself rejected** → the session is locked out entirely; same
+     dead end, discovered one step earlier.

@@ -12,13 +12,22 @@ adapter, or natively over CAN with an ESP32-S3.
    A passive sniff could never have reached it — the OBD port is gateway-isolated
    ([`11-native-can-ecu-scan.md`](docs/findings/11-native-can-ecu-scan.md)) — but the
    setting is *stored*, and stored values are what Service 22 reads.
-   *Open follow-on: can it be **written**? Untested.*
+   *Follow-on, now answered: it **cannot be written**. An Extended Diagnostic
+   Session opens fine and Service `2E` becomes available there, but the ECU
+   refuses the DID itself with `requestOutOfRange` at every level — `B480`
+   mirrors the selector rather than storing it
+   ([`14-regen-write-attempt.md`](docs/findings/14-regen-write-attempt.md)).*
 2. **Read accurate battery state** — SOC, SOH, temperatures, per-cell voltages.
 3. **A standalone in-car device** that serves a live dashboard to a phone, with no
    PC and no phone app (Phase 2 / Phase 3 roadmaps in [`docs/`](docs/)).
 
-Everything is **read-only**: only UDS Service 22 reads and ISO-TP flow control are
-ever transmitted. Nothing is written to the vehicle.
+Essentially **read-only**: normal operation transmits nothing but UDS Service 22
+reads and ISO-TP flow control. The one exception is a deliberate, hard-coded
+experiment — `/regen/set` can send Service `2E` (and `10 03` to open a session)
+for the single DID `B480`, range-checked to 0-2. It is there to answer whether
+regen level can be written; the answer turned out to be **no** (the ECU refuses
+the DID), so nothing is ever actually changed on the vehicle. There is no
+general write path, by design.
 
 ## Hardware
 

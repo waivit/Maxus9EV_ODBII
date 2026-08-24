@@ -664,85 +664,201 @@ static void dash_poll_task(void *arg)
 #define REGEN_DID_HI   0xB4
 #define REGEN_DID_LO   0x80
 
-/* Writes `level` and reports what came back, verbatim, into `out`. */
-static bool regen_write(uint8_t level, char *out, size_t out_sz)
+/* ISO 14229-1 negative response codes, as far as this project has met them. */
+static const char *nrc_text(uint8_t nrc)
+{
+    switch (nrc) {
+    case 0x11: return "serviceNotSupported - not offered at all";
+    case 0x22: return "conditionsNotCorrect - vehicle state blocks it";
+    case 0x31: return "requestOutOfRange - value or DID not writable";
+    case 0x33: return "securityAccessDenied - needs a seed/key unlock";
+    case 0x7E: return "subFunctionNotSupportedInActiveSession";
+    case 0x7F: return "serviceNotSupportedInActiveSession - needs 10 03 first";
+    case 0x88: return "vehicleSpeedTooHigh - stop the vehicle first";
+    default:   return "see NRC";
+    }
+}
+
+/* One request/response round trip on the regen ECU. Caller must already hold
+ * s_bus_mutex - these are composed into multi-step sequences (session then
+ * write) that must stay atomic against dash_poll_task, so the lock belongs to
+ * the whole sequence rather than to each individual frame. */
+typedef enum {
+    UDS_OK,          /* a reply arrived from the expected id                  */
+    UDS_TX_FAILED,   /* the frame never made it onto the bus (nothing ACKed)  */
+    UDS_NO_REPLY,    /* sent fine, but nothing answered within the timeout    */
+} uds_step_t;
+
+static uds_step_t uds_step_locked(const uint8_t *payload, uint8_t len,
+                                  twai_message_t *rx, uint32_t timeout_ms)
+{
+    twai_message_t drain;
+    while (twai_receive(&drain, 0) == ESP_OK) { }    /* drop anything stale */
+
+    twai_message_t tx = { .identifier = REGEN_REQ_ID, .data_length_code = 8 };
+    tx.data[0] = len;                                 /* ISO-TP single frame */
+    for (uint8_t i = 0; i < len && i < 7; i++) tx.data[1 + i] = payload[i];
+    for (uint8_t i = len + 1; i < 8; i++)      tx.data[i]     = UDS_PAD;
+
+    /* Distinguished from "no reply" on purpose: they mean completely different
+     * things (bus/wiring vs ECU behaviour) and reporting both as one string
+     * made the first session experiments impossible to interpret. */
+    if (twai_transmit(&tx, pdMS_TO_TICKS(500)) != ESP_OK) return UDS_TX_FAILED;
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (twai_receive(rx, pdMS_TO_TICKS(100)) != ESP_OK) continue;
+        if (rx->identifier != REGEN_RESP_ID) {
+            /* Log rather than silently drop: if the ECU ever answers from a
+             * different id after a session change, this is how we find out. */
+            char hex[32];
+            frame_hex(rx->data, rx->data_length_code, hex, sizeof(hex));
+            ESP_LOGW(TAG, "  (while waiting: id=0x%03X %s)",
+                     (unsigned)rx->identifier, hex);
+            continue;
+        }
+        return UDS_OK;
+    }
+    return UDS_NO_REPLY;
+}
+
+/* Ask for an Extended Diagnostic Session (10 03). Service 0x10's positive
+ * reply is 0x50. Caller holds s_bus_mutex. */
+static bool session_open_locked(char *out, size_t out_sz)
+{
+    static const uint8_t req[] = { 0x10, 0x03 };
+    twai_message_t rx;
+
+    uds_step_t st = uds_step_locked(req, sizeof(req), &rx, 1000);
+    if (st != UDS_OK) {
+        snprintf(out, out_sz, "10 03: %s",
+                 st == UDS_TX_FAILED ? "TRANSMIT FAILED - nothing ACKed the frame"
+                                     : "no reply within 1 s");
+        return false;
+    }
+
+    char hex[32];
+    frame_hex(rx.data, rx.data_length_code, hex, sizeof(hex));
+    ESP_LOGW(TAG, "session 10 03 -> rx %s", hex);
+
+    if (rx.data[1] == 0x50) {
+        snprintf(out, out_sz, "10 03: OPENED (50 03)");
+        return true;
+    }
+    if (rx.data[1] == 0x7F) {
+        snprintf(out, out_sz, "10 03: REFUSED NRC 0x%02X - %s",
+                 rx.data[3], nrc_text(rx.data[3]));
+        return false;
+    }
+    snprintf(out, out_sz, "10 03: unexpected [%s]", hex);
+    return false;
+}
+
+/* TesterPresent with the suppressPositiveResponse bit set, so the ECU keeps
+ * the session alive without sending a reply that would sit in the RX queue
+ * waiting to be mistaken for the next step's answer. Fire and forget. */
+static void tester_present_locked(void)
+{
+    twai_message_t tx = {
+        .identifier       = REGEN_REQ_ID,
+        .data_length_code = 8,
+        .data = { 0x02, 0x3E, 0x80, UDS_PAD, UDS_PAD, UDS_PAD, UDS_PAD, UDS_PAD },
+    };
+    twai_transmit(&tx, pdMS_TO_TICKS(200));
+}
+
+/* Writes `level`, optionally opening an Extended Diagnostic Session first, and
+ * reports every step verbatim into `out`.
+ *
+ * The whole sequence runs inside one s_bus_mutex hold and returns immediately -
+ * there is deliberately no background task keeping the session open. An
+ * Extended session may change ECU behaviour in ways this project has not
+ * characterised, so the safest shape is to be in it for milliseconds and let it
+ * lapse on its own timeout rather than hold it open indefinitely. */
+static bool regen_write(uint8_t level, bool use_session, char *out, size_t out_sz)
 {
     if (level > 2) {
         snprintf(out, out_sz, "refused: level must be 0, 1 or 2");
         return false;
     }
 
-    /* The only bus user in this file that used to skip s_bus_mutex.
-     * dash_poll_task polls this same DID every cycle, and both receive loops
+    /* dash_poll_task polls this same DID every cycle, and both receive loops
      * match replies by CAN id alone (no per-transaction correlation byte
      * exists in these UDS frames), so without this lock the two could
      * genuinely consume each other's reply frames - see
      * docs/findings/14-regen-write-attempt.md. */
     xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
 
-    twai_message_t m;
-    while (twai_receive(&m, 0) == ESP_OK) { }        /* drop anything stale */
-
-    twai_message_t tx = {
-        .identifier       = REGEN_REQ_ID,
-        .data_length_code = 8,
-        .data = { 0x04, 0x2E, REGEN_DID_HI, REGEN_DID_LO, level,
-                  UDS_PAD, UDS_PAD, UDS_PAD },
-    };
-    if (twai_transmit(&tx, pdMS_TO_TICKS(500)) != ESP_OK) {
-        snprintf(out, out_sz, "transmit failed - nothing on the bus ACKed it");
-        xSemaphoreGive(s_bus_mutex);
-        return false;
-    }
-
-    int64_t deadline = esp_timer_get_time() + 2000 * 1000;
-    while (esp_timer_get_time() < deadline) {
-        if (twai_receive(&m, pdMS_TO_TICKS(100)) != ESP_OK) continue;
-        if (m.identifier != REGEN_RESP_ID) continue;
-
-        char hex[32];
-        frame_hex(m.data, m.data_length_code, hex, sizeof(hex));
-        ESP_LOGW(TAG, "regen write %u -> rx %s", level, hex);
-
-        if (m.data[1] == 0x6E && m.data[2] == REGEN_DID_HI && m.data[3] == REGEN_DID_LO) {
-            snprintf(out, out_sz, "ACCEPTED (6E B4 80) - wrote level %u", level);
-            xSemaphoreGive(s_bus_mutex);
-            return true;
-        }
-        if (m.data[1] == 0x7F) {
-            const char *why =
-                m.data[3] == 0x33 ? "securityAccessDenied - needs an unlock" :
-                m.data[3] == 0x22 ? "conditionsNotCorrect - vehicle state blocks it" :
-                m.data[3] == 0x31 ? "requestOutOfRange - value or DID not writable" :
-                m.data[3] == 0x7E ? "subFunctionNotSupportedInActiveSession" :
-                m.data[3] == 0x7F ? "serviceNotSupportedInActiveSession - needs an Extended session (10 03)" :
-                m.data[3] == 0x88 ? "vehicleSpeedTooHigh - stop the vehicle first" :
-                m.data[3] == 0x11 ? "service not supported at all" : "see NRC";
-            snprintf(out, out_sz, "REJECTED NRC 0x%02X - %s  [%s]", m.data[3], why, hex);
+    size_t o = 0;
+    if (use_session) {
+        char smsg[96];
+        bool opened = session_open_locked(smsg, sizeof(smsg));
+        o += snprintf(out + o, out_sz - o, "%s", smsg);
+        if (!opened) {                     /* no point attempting the write */
             xSemaphoreGive(s_bus_mutex);
             return false;
         }
-        snprintf(out, out_sz, "unexpected reply: %s", hex);
+        tester_present_locked();
+        /* Give the ECU a moment to finish switching sessions before asking it
+         * to do anything else - a 2E fired immediately after 10 03 came back
+         * silent twice, while one sent later into an already-settled session
+         * answered promptly. */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        o += snprintf(out + o, out_sz - o, "  |  ");
+    }
+
+    const uint8_t req[] = { 0x2E, REGEN_DID_HI, REGEN_DID_LO, level };
+    twai_message_t rx;
+    /* 6 s, not 2: right after a session change ISO 14229 lets the ECU fall back
+     * on P2*_server (commonly 5 s) instead of the usual ~50 ms P2, so a 2 s
+     * window can time out on a reply that was going to arrive. */
+    uint32_t wait_ms = use_session ? 6000 : 2000;
+    uds_step_t st = uds_step_locked(req, sizeof(req), &rx, wait_ms);
+    if (st != UDS_OK) {
+        snprintf(out + o, out_sz - o, "2E: %s",
+                 st == UDS_TX_FAILED ? "TRANSMIT FAILED - nothing ACKed the frame"
+                                     : "NO REPLY (sent ok, ECU stayed silent)");
         xSemaphoreGive(s_bus_mutex);
         return false;
     }
-    snprintf(out, out_sz, "no reply within 2 s");
+
+    char hex[32];
+    frame_hex(rx.data, rx.data_length_code, hex, sizeof(hex));
+    ESP_LOGW(TAG, "regen write %u (session=%d) -> rx %s", level, use_session, hex);
+
+    bool ok = false;
+    if (rx.data[1] == 0x6E && rx.data[2] == REGEN_DID_HI && rx.data[3] == REGEN_DID_LO) {
+        snprintf(out + o, out_sz - o, "2E: ACCEPTED (6E B4 80) - wrote level %u", level);
+        ok = true;
+    } else if (rx.data[1] == 0x7F) {
+        snprintf(out + o, out_sz - o, "2E: REJECTED NRC 0x%02X - %s  [%s]",
+                 rx.data[3], nrc_text(rx.data[3]), hex);
+    } else {
+        snprintf(out + o, out_sz - o, "2E: unexpected reply: %s", hex);
+    }
+
     xSemaphoreGive(s_bus_mutex);
-    return false;
+    return ok;
 }
 
 static esp_err_t regen_set_handler(httpd_req_t *req)
 {
-    char q[64] = "", v[8] = "";
+    char q[64] = "", v[8] = "", e[8] = "";
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
         httpd_query_key_value(q, "level", v, sizeof(v)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "usage: /regen/set?level=0|1|2");
+        return httpd_resp_sendstr(req, "usage: /regen/set?level=0|1|2[&ext=1]");
     }
+    /* ext=1 opens an Extended Diagnostic Session (10 03) first. Plain writes
+     * are refused with NRC 0x7F whenever the vehicle is parked, which is what
+     * pointed at the session gate in the first place. */
+    httpd_query_key_value(q, "ext", e, sizeof(e));
+    bool use_session = (e[0] == '1');
 
-    char msg[160];
-    regen_write((uint8_t)atoi(v), msg, sizeof(msg));   /* result is in msg either way */
-    ESP_LOGW(TAG, "regen/set level=%s -> %s", v, msg);
+    char msg[256];
+    msg[0] = '\0';
+    regen_write((uint8_t)atoi(v), use_session, msg, sizeof(msg));  /* msg set either way */
+    ESP_LOGW(TAG, "regen/set level=%s ext=%d -> %s", v, use_session, msg);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_sendstr(req, msg);
 }
@@ -1059,9 +1175,15 @@ static const char HTML_PAGE[] =
 "<div id=bar><div></div></div><div id=slog>idle</div></div>"
 "<div id=rg><p style='color:#888;font-size:14px'>Set regen level "
 "(writes 7E3 B480 - nothing else can be written):</p>"
-"<button onclick='setRegen(0)'>Low</button>"
-"<button onclick='setRegen(1)'>Medium</button>"
-"<button onclick='setRegen(2)'>High</button>"
+"<button onclick='setRegen(0,0)'>Low</button>"
+"<button onclick='setRegen(1,0)'>Medium</button>"
+"<button onclick='setRegen(2,0)'>High</button>"
+"<p style='color:#888;font-size:14px;margin-top:14px'>Plain writes are refused "
+"with NRC 0x7F while parked. These open an Extended Diagnostic Session "
+"(10 03) first, then write:</p>"
+"<button onclick='setRegen(0,1)'>Low +session</button>"
+"<button onclick='setRegen(1,1)'>Medium +session</button>"
+"<button onclick='setRegen(2,1)'>High +session</button>"
 "<div id=rglog style='color:#888;font:13px ui-monospace,monospace;"
 "white-space:pre-wrap;margin-top:10px'>not tried yet</div></div>"
 "<div id=foot>connecting...</div>"
@@ -1072,9 +1194,11 @@ static const char HTML_PAGE[] =
 " document.getElementById('slog').textContent="
 "  await(await fetch('/scan/start?ecus='+encodeURIComponent(e))).text();"
 "}"
-"async function setRegen(l){"
-" const e=document.getElementById('rglog');e.textContent='writing '+l+' ...';"
-" try{e.textContent=await(await fetch('/regen/set?level='+l)).text()}"
+"async function setRegen(l,x){"
+" const e=document.getElementById('rglog');"
+" e.textContent='writing '+l+(x?' with session':'')+' ...';"
+" try{e.textContent=await(await fetch("
+"  '/regen/set?level='+l+(x?'&ext=1':''))).text()}"
 " catch(err){e.textContent='request failed: '+err}"
 "}"
 "async function scanTick(){"

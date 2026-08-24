@@ -91,13 +91,63 @@ substitutes a speed gate instead. No state observed so far reaches
 `0x33` (securityAccessDenied) — the write path is *closed by session*, not
 *locked by security*, as far as tested.
 
+## Follow-up (2026-08-22, second) — Extended Session opens, but `B480` is read-only
+
+The last untested avenue has now been tried. `/regen/set?level=N&ext=1` sends
+`10 03` (Extended Diagnostic Session), a `3E 80` TesterPresent, then the `2E`
+write, all inside one `s_bus_mutex` hold.
+
+### Raw artifacts
+```
+Default session:   03 7F 2E 7F     serviceNotSupportedInActiveSession
+10 03            -> 50 03          session OPENED
+Extended session:  03 7F 2E 31     requestOutOfRange
+```
+Tried at all three levels (Low / Medium / High), vehicle READY and parked.
+Reply arrived in **0.288 s**.
+
+### Observations
+- **The session gate can be passed.** `10 03` is accepted (`50 03`) — the ECU
+  does not lock Extended Session out, which was one of the possible dead ends.
+- **Service `2E` becomes available once in that session.** The NRC moves from
+  `0x7F` (service not offered at all) to `0x31` (service ran, request refused).
+  That transition is itself the proof the session took effect.
+- **`0x31` for every value.** All three valid levels are refused identically, so
+  this is not a value-range problem — it is the DID.
+- **`0x33` (securityAccessDenied) never appeared** at any point. This is not a
+  locked-behind-seed/key situation; the ECU simply does not accept writes here.
+- Session expiry behaves as expected: stop polling, wait, and a plain write
+  returns to `0x7F`. Note that `dash_poll_task`'s own reads keep the session
+  alive while the dashboard is open, since any request resets the S3 timer.
+
+### The "no reply" from the previous follow-up was our own bug
+Earlier attempts reported `2E: no reply` twice. That was not ECU behaviour: the
+`2E` was being fired immediately after `10 03`, while the ECU was still
+switching sessions, and it was dropped. Adding a 100 ms settle delay after the
+session change made the reply appear — and it arrives in under 0.3 s, so the
+timeout was never the issue. *(The timeout was raised to 6 s in the same change
+on a P2\*-timing hypothesis that turned out to be wrong; it is harmless but was
+not what fixed this.)* The old code also collapsed "transmit failed" and "no
+reply" into one message, which made the two indistinguishable — now separated.
+
+## Verdict
+**`B480` is readable but not writable.** It reads as a status mirror of the
+regen selector rather than the store the setting actually lives in. The write
+path is not blocked by session (passable), nor by security (never invoked), nor
+by vehicle state (tested parked and READY) — the ECU refuses the DID itself.
+
+- **H3 read side: `confirmed`** (unchanged, `13-regen-level-found.md`).
+- **H3 write side: closed as not possible via this DID.**
+
 ## Next
-1. ~~Fix the mutex gap~~ — done, see the firmware commit alongside this note.
-2. **Open an Extended Diagnostic Session (`10 03`) before the write**, parked
-   and READY, with `3E 00` (TesterPresent) keeping it alive. This is the one
-   remaining untested avenue:
-   - **Accepted** → the write works; wire it up properly.
-   - **`0x33` securityAccessDenied** → a real dead end; the ECU wants a
-     manufacturer seed/key algorithm this project doesn't have.
-   - **`10 03` itself rejected** → the session is locked out entirely; same
-     dead end, discovered one step earlier.
+Setting regen level over OBD would require finding whichever DID/ECU actually
+*owns* the value rather than mirroring it. That may not exist on the diagnostic
+bus at all — this port is gateway-isolated and forwards no internal traffic
+(`11-native-can-ecu-scan.md`), so the owning module may simply be unreachable
+from here.
+
+What remains fully available is **shadow mode**: regen level is readable live,
+so the device can compute and display what level *would* suit the conditions
+(following distance, braking) and leave the driver to select it. That needs no
+write access and carries none of the risk of automatically changing how the
+vehicle decelerates.

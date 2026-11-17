@@ -193,9 +193,36 @@ static const rep_desc_t REPORT[] = {
     {"cmin", "7E5", "22 B0 59", "B059", 2, 0.001f, 0.0f,    2, "0E0651"},
     {"thi",  "7E5", "22 B0 56", "B056", 1, 0.5f,  -40.0f,   1, "9406"},
     {"tlo",  "7E5", "22 B0 57", "B057", 1, 0.5f,  -40.0f,   1, "920B"},
+    /* Page 2 "measurement conditions". B043 demo bytes are synthetic
+     * (0x9C4A -> +0.25 A); the other demo bytes are real reads. */
+    {"pv",   "7E5", "22 B0 42", "B042", 2, 0.25f,  0.0f,   -1, "0619"},
+    {"cur",  "7E5", "22 B0 43", "B043", 2, 0.025f, -1000.0f, -1, "9C4A"},
+    {"bms",  "7E5", "22 B0 48", "B048", 1, 1.0f,   0.0f,   -1, "03"},
     {"odo",  "7E3", "22 E1 01", "E101", 3, 1.0f,   0.0f,   -1, "00F1D7"},
 };
 #define N_REPORT (sizeof(REPORT) / sizeof(REPORT[0]))
+
+/* Page 2 module groups (multi-frame, formula unverified - H7 b/d). Demo bytes
+ * for the last six are real 2026-07-16 ELM327 reads; the first six have no
+ * capture, so demo shows them as unread (exercises the missing-value path).
+ * The demo modules (3.72 V) and demo cells (3.60 V) come from different days,
+ * so they are not expected to agree. */
+typedef struct { const char *cmd, *did, *demo_raw; } rep_mod_t;
+static const rep_mod_t REPORT_MODS[] = {
+    {"22 B0 01", "B001", NULL}, {"22 B0 09", "B009", NULL},
+    {"22 B0 11", "B011", NULL}, {"22 B0 19", "B019", NULL},
+    {"22 B0 21", "B021", NULL}, {"22 B0 29", "B029", NULL},
+    {"22 B0 A3", "B0A3", "154715548C8CA0"}, {"22 B0 AB", "B0AB", "154C15548C8CA9"},
+    {"22 B0 B3", "B0B3", "154F15548C8CA8"}, {"22 B0 BB", "B0BB", "154F15578C8C9F"},
+    {"22 B0 C3", "B0C3", "154E15538C8CA4"}, {"22 B0 CB", "B0CB", "1545154D8C8CA6"},
+};
+#define N_REPORT_MODS (sizeof(REPORT_MODS) / sizeof(REPORT_MODS[0]))
+
+typedef struct {
+    bool  ok;
+    float va, vb, ta, tb;
+    char  raw[20];
+} rep_mod_val_t;
 
 typedef struct {
     bool  ok;
@@ -462,18 +489,33 @@ static void report_decode(const rep_desc_t *d, const uds_result_t *r, rep_val_t 
     if (d->idx_byte >= 0 && r->n > d->idx_byte) v->idx = r->data[d->idx_byte];
 }
 
-/* Turn canned hex into a parsed-looking positive result (demo mode). */
-static uds_result_t demo_result(const rep_desc_t *d)
+/* Turn canned hex into a parsed-looking result (demo mode). NULL = no reply. */
+static uds_result_t demo_result(const char *did, const char *hex)
 {
     uds_result_t r = {0};
-    r.positive = true;
     r.nrc_code = -1;
-    memcpy(r.did, d->did, 4);
-    for (const char *p = d->demo_raw; p[0] && p[1] && r.n < UDS_MAX_DATA; p += 2) {
+    r.nrc_name = "";
+    if (!hex) return r;
+    r.positive = true;
+    memcpy(r.did, did, 4);
+    for (const char *p = hex; p[0] && p[1] && r.n < UDS_MAX_DATA; p += 2) {
         char h[3] = {p[0], p[1], 0};
         r.data[r.n++] = (uint8_t)strtol(h, NULL, 16);
     }
     return r;
+}
+
+/* Decode one module group: {V_a, V_b, T_a, T_b, ?}, MG formulas (unverified). */
+static void report_decode_mod(const rep_mod_t *m, const uds_result_t *r, rep_mod_val_t *v)
+{
+    memset(v, 0, sizeof(*v));
+    data_hex(r, v->raw, sizeof(v->raw));
+    if (!(r->positive && strcmp(r->did, m->did) == 0 && r->n >= 6)) return;
+    v->ok = true;
+    v->va = be_int16(r->data) / 2000.0f + 1.0f;
+    v->vb = be_int16(r->data + 2) / 2000.0f + 1.0f;
+    v->ta = r->data[4] * 0.5f - 40.0f;
+    v->tb = r->data[5] * 0.5f - 40.0f;
 }
 
 /* Next report number from NVS. Survives power cycles and never resets, so a
@@ -505,13 +547,18 @@ static esp_err_t report_get_handler(httpd_req_t *req)
         httpd_query_key_value(q, "demo", v, sizeof(v)) == ESP_OK && v[0] == '1')
         demo = true;
 
-    rep_val_t vals[N_REPORT];
+    static rep_val_t     vals[N_REPORT];      /* static: httpd stack stays small */
+    static rep_mod_val_t mods[N_REPORT_MODS];
     int ok_count = 0;
 
     if (demo) {
         for (size_t i = 0; i < N_REPORT; i++) {
-            uds_result_t r = demo_result(&REPORT[i]);
+            uds_result_t r = demo_result(REPORT[i].did, REPORT[i].demo_raw);
             report_decode(&REPORT[i], &r, &vals[i]);
+        }
+        for (size_t i = 0; i < N_REPORT_MODS; i++) {
+            uds_result_t r = demo_result(REPORT_MODS[i].did, REPORT_MODS[i].demo_raw);
+            report_decode_mod(&REPORT_MODS[i], &r, &mods[i]);
         }
         ok_count = (int)N_REPORT;
     } else {
@@ -532,6 +579,15 @@ static esp_err_t report_get_handler(httpd_req_t *req)
                      vals[i].ok ? "ok  " : "FAIL", vals[i].raw);
             if (vals[i].ok) ok_count++;
         }
+        for (size_t i = 0; i < N_REPORT_MODS; i++) {
+            for (int attempt = 0; attempt < 2; attempt++) {   /* one retry */
+                uds_result_t r = elm_read("7E5", REPORT_MODS[i].cmd);
+                report_decode_mod(&REPORT_MODS[i], &r, &mods[i]);
+                if (mods[i].ok) break;
+            }
+            ESP_LOGI(TAG, "report mod %s %s raw=%s", REPORT_MODS[i].did,
+                     mods[i].ok ? "ok  " : "FAIL", mods[i].raw);
+        }
         s_led_state = led_before;
         xSemaphoreGive(s_elm_mutex);
         if (ok_count == 0) return send_json(req, "{\"ok\":false,\"err\":\"novalues\"}");
@@ -542,7 +598,7 @@ static esp_err_t report_get_handler(httpd_req_t *req)
     if (!demo && seq == 0) return send_json(req, "{\"ok\":false,\"err\":\"nvs\"}");
     if (!demo) s_led_done = true;            /* 3 quick blinks: report issued */
 
-    static char json[1536];
+    static char json[4096];
     size_t o = 0;
     APPEND(json, o, "{\"ok\":true,\"demo\":%s,\"seq\":%lu,\"fw\":\"%s\",\"profile\":\"%s\",\"v\":{",
            demo ? "true" : "false", (unsigned long)seq, FW_VERSION, REPORT_PROFILE);
@@ -552,7 +608,15 @@ static esp_err_t report_get_handler(httpd_req_t *req)
                i ? "," : "", REPORT[i].key, x->ok ? "true" : "false",
                x->ok ? x->value : 0.0f, x->idx, x->nrc, x->raw);
     }
-    APPEND(json, o, "}}");
+    APPEND(json, o, "},\"mod\":[");
+    for (size_t i = 0; i < N_REPORT_MODS; i++) {
+        const rep_mod_val_t *m = &mods[i];
+        APPEND(json, o, "%s{\"did\":\"%s\",\"ok\":%s,\"va\":%.4f,\"vb\":%.4f,\"ta\":%.1f,"
+               "\"tb\":%.1f,\"raw\":\"%s\"}",
+               i ? "," : "", REPORT_MODS[i].did, m->ok ? "true" : "false",
+               m->va, m->vb, m->ta, m->tb, m->raw);
+    }
+    APPEND(json, o, "]}");
     ESP_LOGI(TAG, "report %s seq=%lu: %d/%d values", demo ? "DEMO" : "real",
              (unsigned long)seq, ok_count, (int)N_REPORT);
     return send_json(req, json);
@@ -704,7 +768,7 @@ static const char HTML_PAGE[] =
     "background:#4ea1ff;color:#fff;font-size:1rem;font-weight:700;text-decoration:none}"
     ".btn:disabled{opacity:.5}"
     ".lnk{background:none;border:0;color:#8ab4ff;text-decoration:underline;font-size:.9rem}"
-    "#rimg{width:100%;margin-top:.6rem;border-radius:6px}"
+    "#rout img{width:100%;margin:.6rem 0 1.4rem;border-radius:6px}"
     /* bottom tab bar */
     "#tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:#18181d;"
     "border-top:1px solid #2a2a33}"
@@ -719,8 +783,7 @@ static const char HTML_PAGE[] =
     "<button id=rgo class=btn>สร้างรายงาน</button><br>"
     "<button id=rdemo class=lnk>ตัวอย่าง (ไม่ต้องต่อรถ)</button>"
     "<p id=rst class=s></p>"
-    "<a id=rdl class=btn style=display:none>บันทึกภาพ</a>"
-    "<img id=rimg alt=\"\" style=display:none>"
+    "<div id=rout></div>"
     "</div>"
     "<div class=s>BT <span class=dot id=dot></span> &middot; poll #<span id=seq>0</span></div>"
     "<div id=tabs></div>"

@@ -189,6 +189,14 @@ about **coexistence + the dashboard pipeline**, not the numbers.
   ("supporting information") · cell max/min + index + spread in mV (raw) · temp
   hi/lo + sensor index · raw SOC. **Not on it:** VIN, good/bad colouring, any
   conclusion about battery replacement, the phrase "anti-odometer-rollback".
+- **Page 2, cell detail (added 2026-11-17 at the user's request):** a second JPG.
+  It shows the measurement conditions (pack V `B042`, current `B043`, raw SOC, BMS
+  state `B048`), the series cell count estimated from pack V ÷ mean cell V, the
+  highest/lowest cell with index and the spread, and the temperature spread. It ends
+  with a fixed explanation: the spread is balance, not health, and how it relates to
+  SOH. There is **no verdict**. The proposed assessment bands
+  (`findings/16-cell-spread-references.md`) wait for Design. The 12-module chart is
+  shown only in demo until H7 (b)+(d) pass.
 - **Desk check (no car):** boot log prints the parser self-test (`uds selftest: N/N
   PASS`) and `?demo=1` renders a watermarked sample. Regression guard only.
 - **Test (user, car READY):** generate a report and compare each value with the

@@ -211,6 +211,22 @@ about **coexistence + the dashboard pipeline**, not the numbers.
 - **Success:** H7 (a) + (b) judged by the user at the car. One real report (VIN-free)
   is dropped into the hub for the taladkrub web side.
 
+## Step 8 — Inspection device for any model (hub handoff H-0138)
+taladkrub inspects any EV/PHEV/HEV for free. Models without a profile are
+explored on site. The user decided on **ELM327 only** (no native-CAN board), and
+every mode is **read-only**.
+
+| Stage | Work | Status |
+| --- | --- | --- |
+| 1 | Safety gate: command allowlist, VIN scrub, 29-bit CAN parsing, version `1.0.0`, JPEG ≤ 2 MB | desk ✅ (self-tests 14/14 + 66/66) · car pending (H8) |
+| 1b | DTC reading (`03 07 0A`, `19 01/02/0A`), opened at the user's request | next (H9) |
+| 2 | Per-model profiles as JSON files on the device, reduced report, warning when the car is not at rest | planned |
+| 3 | Discovery mode: find ECUs, identification DIDs (no VIN), Mode 01, bounded DID sweep, raw log tied to the report number | planned |
+| 4 | Listen-only (`ATMA` + `ATCSM1`), time-boxed | planned |
+| 5 | Next profiles from public data (MG first), unverified until a real car | planned |
+
+Policy: [`inspection-safety.md`](inspection-safety.md).
+
 ---
 
 ## Notes

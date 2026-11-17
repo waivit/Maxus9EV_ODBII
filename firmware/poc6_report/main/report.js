@@ -272,12 +272,31 @@
     out.appendChild(a); out.appendChild(img);
   }
 
-  function toJpeg(cv, name) {
-    if (cv.toBlob) {
-      cv.toBlob(function (b) { show(URL.createObjectURL(b), name); }, 'image/jpeg', 0.92);
-    } else {
-      show(cv.toDataURL('image/jpeg', 0.92), name);
+  /* The website accepts at most 2 MB per image (H-0138). A report is ~300 KB
+   * at 0.92, so this only matters if the layout ever grows: step the quality
+   * down until it fits, and refuse rather than hand over an oversize file. */
+  var MAX_BYTES = 1900000;                     /* margin under 2 MB */
+  var QUALITIES = [0.92, 0.8, 0.7, 0.6, 0.5];
+
+  function toJpeg(cv, name, done) {
+    var i = 0;
+    function attempt() {
+      var q = QUALITIES[i];
+      function check(size, deliver) {
+        if (size <= MAX_BYTES) { deliver(); done(true); return; }
+        if (i < QUALITIES.length - 1) { i++; attempt(); return; }
+        done(false);
+      }
+      if (cv.toBlob) {
+        cv.toBlob(function (b) {
+          check(b.size, function () { show(URL.createObjectURL(b), name); });
+        }, 'image/jpeg', q);
+      } else {
+        var url = cv.toDataURL('image/jpeg', q);
+        check(Math.ceil(url.length * 0.75), function () { show(url, name); });
+      }
     }
+    attempt();
   }
 
   function busy(on) { $('rgo').disabled = on; $('rdemo').disabled = on; }
@@ -293,9 +312,11 @@
         if (!d.ok) { status(ERRORS[d.err] || 'สร้างรายงานไม่ได้'); return; }
         var when = new Date();
         var no = reportNo(when, d.seq, d.demo);
-        toJpeg(render(d, when, no), no);
-        status((d.demo ? 'ภาพตัวอย่าง (ไม่นับเลขรายงาน) · ' : 'เลขรายงาน ' + no + ' · ') +
-               'กด "บันทึกภาพ" หรือกดค้างที่ภาพเพื่อบันทึก');
+        toJpeg(render(d, when, no), no, function (ok) {
+          status(!ok ? 'ภาพใหญ่เกิน 2 MB · สร้างภาพไม่ได้' :
+                 (d.demo ? 'ภาพตัวอย่าง (ไม่นับเลขรายงาน) · ' : 'เลขรายงาน ' + no + ' · ') +
+                 'กด "บันทึกภาพ" หรือกดค้างที่ภาพเพื่อบันทึก');
+        });
       })
       .catch(function () { status('เชื่อมต่ออุปกรณ์ไม่ได้ · ตรวจว่ามือถือยังต่อ WiFi MaxusBridge'); })
       .then(function () { busy(false); });

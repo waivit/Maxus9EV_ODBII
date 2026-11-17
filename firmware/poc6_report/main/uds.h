@@ -28,6 +28,10 @@ typedef struct {
  * the real reply following it in the same read is used. */
 uds_result_t uds_parse(const char *raw);
 
+/* Same, with an explicit CAN id length in hex characters: 3 for 11-bit
+ * (ATSP6/8), 8 for 29-bit (ATSP7/9). uds_parse() is uds_parse_id(raw, 3). */
+uds_result_t uds_parse_id(const char *raw, int id_chars);
+
 /* Run the parser against captured reply vectors; logs each case and returns the
  * number of failures. A regression guard for the parser, not a vehicle test. */
 int uds_selftest(void);

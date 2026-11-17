@@ -35,10 +35,11 @@
 #include "nvs.h"
 #include "driver/gpio.h"
 #include "uds.h"
+#include "safety.h"
 
 static const char *TAG = "poc6_rep";
 
-#define FW_VERSION     "poc6-report 0.1.0"
+#define FW_VERSION     "1.0.0"          /* official name for customer use (H-0138) */
 #define REPORT_PROFILE "maxus9"
 
 /* --- WiFi SoftAP config --- */
@@ -325,6 +326,12 @@ static bool name_looks_like_elm(const char *name)
 static bool elm_cmd(const char *cmd, char *clean_out, size_t clean_sz, uint32_t timeout_ms)
 {
     clean_out[0] = '\0';
+    /* The single gate to the car: nothing outside the read-only allowlist
+     * is ever written to the adapter (docs/inspection-safety.md). */
+    if (!safety_cmd_allowed(cmd)) {
+        ESP_LOGE(TAG, "BLOCKED command (not on the read-only allowlist): \"%s\"", cmd);
+        return false;
+    }
     if (!s_spp_handle) return false;
     xStreamBufferReset(s_rx_stream);
 
@@ -370,7 +377,12 @@ static uds_result_t elm_read(const char *header, const char *cmd)
         strncpy(s_cur_hdr, header, sizeof(s_cur_hdr) - 1);
     }
     elm_cmd(cmd, buf, sizeof(buf), 2000);
-    return uds_parse(buf);
+    uds_result_t r = uds_parse(buf);
+    /* No VIN may be stored or shown, even from a DID we did not expect to
+     * carry one (ECU 718 B019 does, note 11). */
+    int masked = safety_scrub_vin(r.data, r.n);
+    if (masked) ESP_LOGW(TAG, "VIN-like data masked in reply to %s %s", header, cmd);
+    return r;
 }
 
 /* Format the decoded data bytes of a result as hex, into out. */
@@ -885,7 +897,8 @@ void app_main(void)
     ESP_LOGI(TAG, "==============================");
     ESP_LOGI(TAG, " %s (%d PIDs, %d report values)", FW_VERSION, (int)N_PIDS, (int)N_REPORT);
     ESP_LOGI(TAG, "==============================");
-    uds_selftest();
+    int uds_fails = uds_selftest();
+    int safety_fails = safety_selftest();
     xTaskCreate(led_task, "led", 2048, NULL, 2, NULL);
 
     s_snap_mutex = xSemaphoreCreateMutex();
@@ -895,5 +908,13 @@ void app_main(void)
 
     wifi_ap_init();
     http_start();
+    /* Fail-closed: if the safety gate or the parser does not pass its own
+     * self-test, never connect to the car. WiFi stays up so the state is
+     * visible (BT dot stays red, LED keeps the slow "searching" blink). */
+    if (uds_fails || safety_fails) {
+        ESP_LOGE(TAG, "self-test failed (uds %d, safety %d): NOT connecting to the ELM327",
+                 uds_fails, safety_fails);
+        return;
+    }
     bt_init();
 }

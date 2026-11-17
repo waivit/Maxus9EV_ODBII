@@ -81,6 +81,14 @@ idf.py build flash monitor
 **ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and
 no report number. Use it at the desk to check the layout.
 
+### Read-only safety gate (from 1.0.0)
+Every command to the ELM327 passes an allowlist in `main/safety.c`. Only adapter
+setup and the read services `01`, `09` and `22` get through, never a VIN request.
+Anything else is refused and logged as `BLOCKED`. Replies are scrubbed of
+VIN-like data before they are stored or shown. If either boot self-test fails,
+the device does not connect to the car. Policy and limits:
+[`../docs/inspection-safety.md`](../docs/inspection-safety.md).
+
 ### Status LED (onboard, GPIO2 / "D2")
 | LED | Meaning |
 | --- | --- |
@@ -91,5 +99,5 @@ no report number. Use it at the desk to check the layout.
 | 3 quick blinks | report issued |
 
 ### Desk check
-The boot log must show `uds selftest: N/N PASS`. That is a **regression guard** built
+The boot log must show `uds selftest: N/N PASS` and `safety selftest: N/N PASS`. That is a **regression guard** built
 from captured bytes. It is not a verification against the car.

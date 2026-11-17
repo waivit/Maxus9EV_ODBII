@@ -23,7 +23,6 @@
 static const char *TAG = "uds";
 
 #define ISOTP_MAX 64              /* largest reassembled payload we keep       */
-#define MF_FRAME_CHARS 19         /* 3-char id + 8 bytes as hex                */
 
 typedef struct { int code; const char *name; } nrc_entry_t;
 static const nrc_entry_t NRC_TABLE[] = {
@@ -96,15 +95,23 @@ static bool interpret(const uint8_t *pl, int len, uds_result_t *r)
 
 uds_result_t uds_parse(const char *raw)
 {
+    return uds_parse_id(raw, 3);
+}
+
+uds_result_t uds_parse_id(const char *raw, int idl)
+{
     uds_result_t r = {0};
     r.nrc_code = -1;
     r.nrc_name = "";
+    if (idl != 3 && idl != 8) return r;           /* 11-bit or 29-bit only */
+    const size_t idz = (size_t)idl;
+    const size_t mf_frame_chars = idz + 16;       /* id + 8 data bytes as hex */
 
     /* Multi-frame assembly state. */
     uint8_t pl[ISOTP_MAX];
     int  mf_total = 0, mf_have = 0, mf_next_sn = 0;
     bool mf_active = false;
-    char mf_id[3] = {0};
+    char mf_id[8] = {0};
 
     const char *t = raw;
     while (*t) {
@@ -122,35 +129,36 @@ uds_result_t uds_parse(const char *raw)
         /* A token may hold several frames back to back (no separator). Walk it
          * frame by frame using the PCI to find each frame's length. */
         size_t pos = 0;
-        while (tlen - pos >= 5) {
+        while (tlen - pos >= idz + 2) {
             const char *f = start + pos;
+            const char *p = f + idz;                     /* PCI byte as hex */
             size_t rem = tlen - pos;
-            int pci = hexnib(f[3]);
+            int pci = hexnib(p[0]);
             size_t flen;
             if (pci == 0) {
-                int n = hexnib(f[4]);
-                flen = 5 + 2 * (size_t)n;
+                int n = hexnib(p[1]);
+                flen = idz + 2 + 2 * (size_t)n;
                 if (flen > rem) flen = rem;
             } else {
-                flen = rem < MF_FRAME_CHARS ? rem : MF_FRAME_CHARS;
+                flen = rem < mf_frame_chars ? rem : mf_frame_chars;
             }
             pos += flen;
             r.valid = true;
 
             if (pci == 0) {                                  /* single frame */
-                int n = hexnib(f[4]);
-                int got = take_bytes(f + 5, flen - 5, pl, n);
+                int n = hexnib(p[1]);
+                int got = take_bytes(p + 2, flen - idz - 2, pl, n);
                 mf_active = false;
                 if (interpret(pl, got, &r)) return r;
-            } else if (pci == 1 && flen >= 7) {              /* first frame */
-                mf_total = (hexnib(f[4]) << 8) | hexbyte(f + 5);
+            } else if (pci == 1 && flen >= idz + 4) {        /* first frame */
+                mf_total = (hexnib(p[1]) << 8) | hexbyte(p + 2);
                 if (mf_total > ISOTP_MAX) mf_total = ISOTP_MAX;
-                mf_have = take_bytes(f + 7, flen - 7, pl, mf_total < 6 ? mf_total : 6);
+                mf_have = take_bytes(p + 4, flen - idz - 4, pl, mf_total < 6 ? mf_total : 6);
                 mf_next_sn = 1;
                 mf_active = true;
-                memcpy(mf_id, f, 3);
-            } else if (pci == 2 && mf_active && memcmp(mf_id, f, 3) == 0) {
-                int sn = hexnib(f[4]);
+                memcpy(mf_id, f, idz);
+            } else if (pci == 2 && mf_active && memcmp(mf_id, f, idz) == 0) {
+                int sn = hexnib(p[1]);
                 if (sn != mf_next_sn) {                      /* lost a frame */
                     ESP_LOGW(TAG, "ISO-TP sequence %d, expected %d - dropped", sn, mf_next_sn);
                     mf_active = false;
@@ -158,7 +166,7 @@ uds_result_t uds_parse(const char *raw)
                 }
                 int want = mf_total - mf_have;
                 if (want > 7) want = 7;
-                mf_have += take_bytes(f + 5, flen - 5, pl + mf_have, want);
+                mf_have += take_bytes(p + 2, flen - idz - 2, pl + mf_have, want);
                 mf_next_sn = (mf_next_sn + 1) & 0xF;
                 if (mf_have >= mf_total) {
                     mf_active = false;
@@ -181,6 +189,7 @@ typedef struct {
     const char *did;        /* when positive */
     const char *data_hex;   /* when positive */
     int         nrc;        /* -1 = none expected */
+    int         idl;        /* id length in hex chars; 0 = 3 (11-bit) */
 } uds_case_t;
 
 /* Vectors marked "capture" are verbatim ELM327 replies from
@@ -189,23 +198,32 @@ typedef struct {
  * sanitizer delivers them. "synthetic" cases are hand-built for paths the
  * capture does not contain. */
 static const uds_case_t CASES[] = {
-    {"capture: B061 single frame", "7ED0562B0612512", true, "B061", "2512", -1},
-    {"capture: B063 single frame, 3 bytes", "7ED0662B0630001FD", true, "B063", "0001FD", -1},
+    {"capture: B061 single frame", "7ED0562B0612512", true, "B061", "2512", -1, 3},
+    {"capture: B063 single frame, 3 bytes", "7ED0662B0630001FD", true, "B063", "0001FD", -1, 3},
     {"capture: B0A3 multi-frame, joined", "7ED100A62B0A31547157ED21548C8CA0AAAAAA",
-     true, "B0A3", "154715548C8CA0", -1},
+     true, "B0A3", "154715548C8CA0", -1, 3},
     {"capture, spaced: B0A3 multi-frame", "7ED100A62B0A3154715 7ED21548C8CA0AAAAAA",
-     true, "B0A3", "154715548C8CA0", -1},
+     true, "B0A3", "154715548C8CA0", -1, 3},
     {"capture, spaced: B0C3 multi-frame", "7ED100A62B0C3154E15 7ED21538C8CA4AAAAAA",
-     true, "B0C3", "154E15538C8CA4", -1},
-    {"capture: B06B NRC 0x31", "7ED037F2231", false, NULL, NULL, 0x31},
+     true, "B0C3", "154E15538C8CA4", -1, 3},
+    {"capture: B06B NRC 0x31", "7ED037F2231", false, NULL, NULL, 0x31, 3},
     {"synthetic: ELM status text before reply", "SEARCHING... 7ED0562B0612512",
-     true, "B061", "2512", -1},
+     true, "B061", "2512", -1, 3},
     {"synthetic: 0x78 pending, then reply", "7ED037F2278 7ED0562B0612512",
-     true, "B061", "2512", -1},
-    {"synthetic: first frame only (truncated)", "7ED100A62B0A3154715", false, NULL, NULL, -1},
+     true, "B061", "2512", -1, 3},
+    {"synthetic: first frame only (truncated)", "7ED100A62B0A3154715", false, NULL, NULL, -1, 3},
     {"synthetic: wrong sequence number", "7ED100A62B0A3154715 7ED22548C8CA0AAAAAA",
-     false, NULL, NULL, -1},
-    {"synthetic: NO DATA", "NO DATA", false, NULL, NULL, -1},
+     false, NULL, NULL, -1, 3},
+    {"synthetic: NO DATA", "NO DATA", false, NULL, NULL, -1, 3},
+    /* 29-bit CAN (ATSP7/9): the id prints as 8 hex chars. No car has given us
+     * a 29-bit capture yet, so these are synthetic: the 11-bit captures above
+     * with the id swapped for 18DAF110. */
+    {"synthetic 29-bit: single frame", "18DAF1100562B0612512",
+     true, "B061", "2512", -1, 8},
+    {"synthetic 29-bit: multi-frame, spaced",
+     "18DAF110100A62B0A3154715 18DAF11021548C8CA0AAAAAA",
+     true, "B0A3", "154715548C8CA0", -1, 8},
+    {"synthetic 29-bit: NRC 0x31", "18DAF110037F2231", false, NULL, NULL, 0x31, 8},
 };
 
 int uds_selftest(void)
@@ -213,7 +231,7 @@ int uds_selftest(void)
     int fails = 0, total = (int)(sizeof(CASES) / sizeof(CASES[0]));
     for (int i = 0; i < total; i++) {
         const uds_case_t *c = &CASES[i];
-        uds_result_t r = uds_parse(c->raw);
+        uds_result_t r = uds_parse_id(c->raw, c->idl ? c->idl : 3);
         char hex[2 * UDS_MAX_DATA + 1] = {0};
         for (int k = 0; k < r.n; k++) {
             static const char HX[] = "0123456789ABCDEF";

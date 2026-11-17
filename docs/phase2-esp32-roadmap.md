@@ -189,6 +189,13 @@ about **coexistence + the dashboard pipeline**, not the numbers.
   ("supporting information") · cell max/min + index + spread in mV (raw) · temp
   hi/lo + sensor index · raw SOC. **Not on it:** VIN, good/bad colouring, any
   conclusion about battery replacement, the phrase "anti-odometer-rollback".
+- **Revised the same day (user):** page 2 was folded back into **one page**: a
+  large-type summary (SOH, odometer, raw SOC, cell spread) above a small-type
+  technical block (highest/lowest cell + index, temperature range, pack V, short
+  explanation). Pack current, sensor indices, BMS state and the estimated cell
+  count were dropped. The cell count has no spec, so the user chose to show
+  nothing rather than an estimate. The text below records the intermediate
+  two-page version.
 - **Page 2, cell detail (added 2026-11-17 at the user's request):** a second JPG.
   It shows the measurement conditions (pack V `B042`, current `B043`, raw SOC, BMS
   state `B048`), the series cell count estimated from pack V ÷ mean cell V, the

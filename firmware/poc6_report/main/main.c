@@ -779,7 +779,7 @@ static const char HTML_PAGE[] =
     "<h2>MAXUS 9 EV</h2>"
     "<table id=t></table>"
     "<div id=rep style=display:none>"
-    "<p class=s>ให้รถอยู่ในสถานะ READY และจอดนิ่งก่อนกดสร้างรายงาน</p>"
+    "<p class=s>ให้รถอยู่ในสถานะ READY จอดนิ่ง และปิดแอร์ก่อนกดสร้างรายงาน</p>"
     "<button id=rgo class=btn>สร้างรายงาน</button><br>"
     "<button id=rdemo class=lnk>ตัวอย่าง (ไม่ต้องต่อรถ)</button>"
     "<p id=rst class=s></p>"

@@ -67,14 +67,15 @@ idf.py build flash monitor
 1. Phone joins WiFi `MaxusBridge` (pass `maxus1234`) → open `http://192.168.4.1/`.
 2. Tab **รายงาน** → **สร้างรายงาน**. The dashboard pauses for a few seconds while
    the report set is read fresh.
-3. Two previews appear, and each has its own save button:
-   - **page 1** (summary, Design's list) → `TK-YYMM-NNNN.jpg`
-   - **page 2** (cell detail: measurement conditions, estimated series cell count,
-     highest/lowest cell and the spread, temperature spread, a plain-language
-     explanation, no verdict) → `TK-YYMM-NNNN-2.jpg`
+3. A preview appears → **บันทึกภาพ** saves `TK-YYMM-NNNN.jpg`. The page has two parts:
+   - **Summary** (large type): SOH, odometer, raw SOC and the cell-voltage spread.
+   - **Technical detail** (small type): highest/lowest cell with index, the
+     battery temperature range, the pack voltage, and a short explanation of how
+     the spread relates to SOH. It gives no verdict.
 
-   On iPhone you can also long-press a preview to save it. The 12-module chart on
-   page 2 is switched off for real reports (`SHOW_MODULES` in `report.js`) until the
+   On iPhone you can also long-press the preview to save it. Turn the A/C off
+   before generating, so the reading is taken close to rest. The 12-module chart
+   is switched off for real reports (`SHOW_MODULES` in `report.js`) until the
    module formula is checked at the car (H7 b/d). Demo always shows it.
 
 **ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and

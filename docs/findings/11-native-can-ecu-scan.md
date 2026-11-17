@@ -86,7 +86,7 @@ how unknown modules can be identified:
 | 730 | `SCM0323V05` | `SWV3.81107` | |
 | 732 / 733 | `B00A29MIFA` | `A00A52MIFA` | identical pair (two of the same module) |
 
-### Per-cell module data — and it is single-frame
+### Per-cell module data — ~~and it is single-frame~~ (corrected 2026-11-17: it is multi-frame, see the end of this note)
 Note 09 predicted per-cell stats at `B001, B009, B011, B019, B021, B029, B0A3…`
 and expected them to need multi-frame. They return **7-byte single frames**:
 ```
@@ -192,3 +192,30 @@ now applied across the whole ECU map instead of one PID range.
 **Caveat to control for:** many values drift on their own (voltages, temperatures,
 counters), so a single diff will return noise as well as signal. Requiring the
 candidate to move *monotonically across all three* levels is what separates them.
+
+---
+
+## Correction (2026-11-17) — the module groups are multi-frame, not single-frame
+
+The heading "and it is single-frame" above is **wrong**, and so is the claim in
+the Verdict that the 12 groups are single-frame. Each group returns **7 data
+bytes**; with the `62` + 2-byte DID that is a **10-byte** UDS payload, and a
+classic-CAN ISO-TP single frame carries at most 7. These replies can only arrive
+as a first frame plus a consecutive frame. The poc5 dump printed the reassembled
+data, which is what made them look single-frame.
+
+The raw ELM327 capture from 2026-07-16 shows the framing directly:
+```
+captures/20260716_104946_7E5_B0_scan061-0FF.jsonl
+B0A3 raw: 7ED 10 0A 62 B0 A3 15 47 15   <- first frame, length 0x0A = 10
+          7ED 21 54 8C 8C A0 AA AA AA   <- consecutive frame #1
+```
+The same capture shows the ELM327 handling far longer replies (`B0EC`, 0x193 =
+403 bytes), which also corrects the wider belief, repeated in the Phase 3
+roadmap, that multi-frame was "a capability the ELM327 path never had". The
+ELM327 sends flow control on its own. The part that was missing was a
+**parser**: `firmware/poc4_idf_decode/main/uds.c` only handled single frames.
+
+Consequence: reading the module groups over ELM327 needs ISO-TP reassembly on
+the ESP32. That reassembly is added in `firmware/poc6_report` and tracked as
+**H7**.

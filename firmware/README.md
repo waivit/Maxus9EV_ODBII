@@ -49,3 +49,30 @@ blink, the serial output is the authoritative check).
 
 If the chip model is S3/C3 or the compile fails on `BluetoothSerial.h`, the board is
 unsuitable — use an ESP32-WROOM-32 before Step 2.
+
+## poc6_report — battery inspection report (ESP-IDF)
+
+poc4 (BT → ELM327 → WiFi dashboard) plus a **report image** for taladkrub (hub
+handoff H-0135, hypothesis H7). Plan and scope: Step 7 in
+[`../docs/phase2-esp32-roadmap.md`](../docs/phase2-esp32-roadmap.md).
+
+### Build & flash
+```
+cd firmware/poc6_report
+idf.py set-target esp32      # first time only
+idf.py build flash monitor
+```
+
+### Use
+1. Phone joins WiFi `MaxusBridge` (pass `maxus1234`) → open `http://192.168.4.1/`.
+2. Tab **รายงาน** → **สร้างรายงาน**. The dashboard pauses for a few seconds while
+   the report set is read fresh.
+3. A preview appears → **บันทึกภาพ** saves `TK-YYMM-NNNN.jpg`. On iPhone you can also
+   long-press the preview to save it.
+
+**ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and
+no report number. Use it at the desk to check the layout.
+
+### Desk check
+The boot log must show `uds selftest: N/N PASS`. That is a **regression guard** built
+from captured bytes. It is not a verification against the car.

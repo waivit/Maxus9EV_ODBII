@@ -166,6 +166,36 @@ about **coexistence + the dashboard pipeline**, not the numbers.
   birds). *(Safe realtime reading while driving is why logging will be added later.)*
 - **Needs full install + driving.**
 
+## Step 7 — Inspection report (JPG) for taladkrub  🔧 (hub handoff H-0135, hypothesis H7)
+- **Goal:** one tap on the phone produces a **battery inspection report image** a
+  buyer can read. The image is uploaded to taladkrub by hand; the device itself never
+  touches the internet.
+- **Build:** `firmware/poc6_report/` is a copy of poc4 plus:
+  - **ISO-TP reassembly** in `uds.c` (first + consecutive frames, sequence check,
+    NRC `0x78` skipped). The ELM327 already sends flow control. Only the parser was
+    missing (note 11, correction 2026-11-17).
+  - **`/report`**: the dashboard poller pauses (shared ELM mutex). The device reads
+    the report set fresh, retries a failed DID once, bumps an NVS counter, and
+    returns JSON. With `?demo=1` it decodes canned raw bytes instead, does not count,
+    and the image carries a watermark.
+  - **`/report.js`**: the phone's browser draws the report on a Canvas (Thai text from
+    the phone's own fonts, logo drawn from its SVG paths) and saves it as JPEG
+    1080 px wide, ≤ 2000 px tall.
+  - **Module tab** on the dashboard: the 12 groups `B001`…`B0CB`, tagged `test`.
+    They are not on the image (formula unverified).
+- **Report content (from Design, H-0135):** logo + title · report number
+  `TK-YYMM-NNNN` · date/time · profile `maxus9` + firmware · SOH ("value reported
+  by the car's battery system, not yet compared with a service centre") · odometer
+  ("supporting information") · cell max/min + index + spread in mV (raw) · temp
+  hi/lo + sensor index · raw SOC. **Not on it:** VIN, good/bad colouring, any
+  conclusion about battery replacement, the phrase "anti-odometer-rollback".
+- **Desk check (no car):** boot log prints the parser self-test (`uds selftest: N/N
+  PASS`) and `?demo=1` renders a watermarked sample. Regression guard only.
+- **Test (user, car READY):** generate a report and compare each value with the
+  dashboard tabs. Check that the Module tab fills in.
+- **Success:** H7 (a) + (b) judged by the user at the car. One real report (VIN-free)
+  is dropped into the hub for the taladkrub web side.
+
 ---
 
 ## Notes

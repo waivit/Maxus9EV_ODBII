@@ -339,7 +339,9 @@ static bool elm_cmd(const char *cmd, char *clean_out, size_t clean_sz, uint32_t 
     int n = snprintf(out, sizeof(out), "%s\r", cmd);
     esp_spp_write((uint32_t)s_spp_handle, n, (uint8_t *)out);
 
-    char raw[320];
+    /* Static: long DTC lists arrive as many frames, and every caller holds
+     * s_elm_mutex, so only one elm_cmd() runs at a time. */
+    static char raw[1024];
     size_t rlen = 0;
     bool got_prompt = false;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
@@ -367,15 +369,20 @@ static bool elm_cmd(const char *cmd, char *clean_out, size_t clean_sz, uint32_t 
 
 /* Send a Service 22 request to `header`, switching ATSH only when needed.
  * Caller holds s_elm_mutex. */
+/* Set the request header, only when it changes. Caller holds s_elm_mutex. */
+static void elm_header(const char *header)
+{
+    if (strcmp(s_cur_hdr, header) == 0) return;
+    char h[16], buf[64];
+    snprintf(h, sizeof(h), "ATSH %s", header);
+    elm_cmd(h, buf, sizeof(buf), 2000);
+    strncpy(s_cur_hdr, header, sizeof(s_cur_hdr) - 1);
+}
+
 static uds_result_t elm_read(const char *header, const char *cmd)
 {
     char buf[256];
-    if (strcmp(s_cur_hdr, header) != 0) {
-        char h[16];
-        snprintf(h, sizeof(h), "ATSH %s", header);
-        elm_cmd(h, buf, sizeof(buf), 2000);
-        strncpy(s_cur_hdr, header, sizeof(s_cur_hdr) - 1);
-    }
+    elm_header(header);
     elm_cmd(cmd, buf, sizeof(buf), 2000);
     uds_result_t r = uds_parse(buf);
     /* No VIN may be stored or shown, even from a DID we did not expect to
@@ -634,6 +641,126 @@ static esp_err_t report_get_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+/* ============================ DTC read (H9) ============================ */
+/* Read-only: OBD 03/07/0A functionally on 7DF, then UDS 19 02 FF on each ECU
+ * below. The ECU list is MAXUS-specific until per-model profiles (H-0138
+ * stage 2) replace it. Clearing (04/14) is blocked by safety.c regardless. */
+typedef struct { const char *name, *header; } dtc_ecu_t;
+static const dtc_ecu_t DTC_UDS_ECUS[] = {
+    {"BMS", "7E5"}, {"IMCU", "7E3"}, {"CCU", "7E4"},
+};
+static const char *DTC_OBD_MODES[] = {"03", "07", "0A"};
+#define DTC_MAX_PER_MSG 60
+
+static void msg_hex(const isotp_msg_t *m, char *out, size_t sz)
+{
+    size_t o = 0;
+    out[0] = '\0';
+    for (int i = 0; i < m->len && o + 2 < sz; i++)
+        o += snprintf(out + o, sz - o, "%02X", m->data[i]);
+}
+
+static esp_err_t dtc_get_handler(httpd_req_t *req)
+{
+    if (!s_elm_ready) return send_json(req, "{\"ok\":false,\"err\":\"bt\"}");
+    if (xSemaphoreTake(s_elm_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
+        return send_json(req, "{\"ok\":false,\"err\":\"busy\"}");
+    led_state_t led_before = s_led_state;
+    s_led_state = LED_REPORTING;
+
+    static char json[8192];
+    static char reply[1024];
+    static char hex[2 * ISOTP_MSG_MAX + 1];
+    static isotp_msg_t msgs[ISOTP_COLLECT_MAX];
+    size_t o = 0;
+    int total = 0;
+    APPEND(json, o, "{\"ok\":true,\"fw\":\"%s\",\"profile\":\"%s\",\"obd\":[",
+           FW_VERSION, REPORT_PROFILE);
+
+    /* Standard OBD, functional: every emissions-relevant ECU may answer. */
+    elm_header("7DF");
+    for (size_t mi = 0; mi < sizeof(DTC_OBD_MODES) / sizeof(DTC_OBD_MODES[0]); mi++) {
+        elm_cmd(DTC_OBD_MODES[mi], reply, sizeof(reply), 3000);
+        int n = isotp_collect(reply, 3, msgs, ISOTP_COLLECT_MAX);
+        uint8_t positive = (uint8_t)(strtol(DTC_OBD_MODES[mi], NULL, 16) + 0x40);
+        APPEND(json, o, "%s{\"mode\":\"%s\",\"ecus\":[", mi ? "," : "", DTC_OBD_MODES[mi]);
+        for (int k = 0; k < n; k++) {
+            isotp_msg_t *m = &msgs[k];
+            safety_scrub_vin(m->data, m->len);
+            msg_hex(m, hex, sizeof(hex));
+            APPEND(json, o, "%s{\"id\":\"%s\",", k ? "," : "", m->id);
+            if (m->len >= 1 && m->data[0] == positive) {
+                /* CAN replies carry a DTC count after the service byte; accept
+                 * a reply without it too. 0000 is padding, not a code. */
+                int start = 1, count = (m->len - 1) / 2;
+                if (m->len >= 2 && m->len == 2 + 2 * m->data[1]) { start = 2; count = m->data[1]; }
+                APPEND(json, o, "\"dtcs\":[");
+                int shown = 0;
+                for (int d = 0; d < count && d < DTC_MAX_PER_MSG; d++) {
+                    uint8_t a = m->data[start + 2 * d], b = m->data[start + 2 * d + 1];
+                    if (a == 0 && b == 0) continue;
+                    char code[6];
+                    dtc_format(a, b, code);
+                    APPEND(json, o, "%s\"%s\"", shown++ ? "," : "", code);
+                }
+                total += shown;
+                APPEND(json, o, "]");
+            } else if (m->len >= 3 && m->data[0] == 0x7F) {
+                APPEND(json, o, "\"nrc\":%d", m->data[2]);
+            } else {
+                APPEND(json, o, "\"other\":true");
+            }
+            APPEND(json, o, ",\"raw\":\"%s\"}", hex);
+        }
+        APPEND(json, o, "]}");
+        ESP_LOGI(TAG, "dtc OBD %s: %d ECU repl%s", DTC_OBD_MODES[mi], n, n == 1 ? "y" : "ies");
+    }
+
+    /* UDS, per ECU: all DTCs with any status bit set. */
+    APPEND(json, o, "],\"uds\":[");
+    for (size_t ei = 0; ei < sizeof(DTC_UDS_ECUS) / sizeof(DTC_UDS_ECUS[0]); ei++) {
+        const dtc_ecu_t *e = &DTC_UDS_ECUS[ei];
+        elm_header(e->header);
+        elm_cmd("19 02 FF", reply, sizeof(reply), 3000);
+        int n = isotp_collect(reply, 3, msgs, ISOTP_COLLECT_MAX);
+        APPEND(json, o, "%s{\"name\":\"%s\",\"ecu\":\"%s\",", ei ? "," : "", e->name, e->header);
+        if (n == 0) {
+            APPEND(json, o, "\"answered\":false}");
+            ESP_LOGI(TAG, "dtc UDS %s: no answer", e->header);
+            continue;
+        }
+        isotp_msg_t *m = &msgs[0];
+        safety_scrub_vin(m->data, m->len);
+        msg_hex(m, hex, sizeof(hex));
+        APPEND(json, o, "\"answered\":true,");
+        if (m->len >= 3 && m->data[0] == 0x59 && m->data[1] == 0x02) {
+            int count = (m->len - 3) / 4;
+            APPEND(json, o, "\"avail\":%d,\"dtcs\":[", m->data[2]);
+            for (int d = 0; d < count && d < DTC_MAX_PER_MSG; d++) {
+                const uint8_t *r = m->data + 3 + 4 * d;
+                char code[6];
+                dtc_format(r[0], r[1], code);
+                APPEND(json, o, "%s{\"code\":\"%s-%02X\",\"status\":\"%02X\"}",
+                       d ? "," : "", code, r[2], r[3]);
+            }
+            total += count < DTC_MAX_PER_MSG ? count : DTC_MAX_PER_MSG;
+            APPEND(json, o, "]");
+        } else if (m->len >= 3 && m->data[0] == 0x7F) {
+            APPEND(json, o, "\"nrc\":%d", m->data[2]);
+        } else {
+            APPEND(json, o, "\"other\":true");
+        }
+        APPEND(json, o, ",\"raw\":\"%s\"}", hex);
+        ESP_LOGI(TAG, "dtc UDS %s: %d bytes", e->header, m->len);
+    }
+    APPEND(json, o, "],\"total\":%d}", total);
+
+    s_led_state = led_before;
+    xSemaphoreGive(s_elm_mutex);
+    ESP_LOGI(TAG, "dtc read done: %d code(s)", total);
+    return send_json(req, json);
+}
+
 /* ============================== BT callbacks ============================== */
 
 static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
@@ -781,6 +908,13 @@ static const char HTML_PAGE[] =
     ".btn:disabled{opacity:.5}"
     ".lnk{background:none;border:0;color:#8ab4ff;text-decoration:underline;font-size:.9rem}"
     "#rout img{width:100%;margin:.6rem 0 1.4rem;border-radius:6px}"
+    "hr.sep{border:0;border-top:1px solid #2a2a33;margin:1.6rem 0}"
+    ".h{font-size:1rem;margin:.4rem 0}"
+    "#dout{text-align:left;font-size:.9rem}"
+    "#dout h4{margin:1rem 0 .3rem;font-size:.9rem;color:#c8c8d0}"
+    "#dout .row{padding:.35rem 0;border-bottom:1px solid #262630}"
+    "#dout .code{font-family:monospace;font-weight:700;color:#4ea1ff}"
+    "#dout .mut{color:#8a8a8a}"
     /* bottom tab bar */
     "#tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:#18181d;"
     "border-top:1px solid #2a2a33}"
@@ -796,6 +930,13 @@ static const char HTML_PAGE[] =
     "<button id=rdemo class=lnk>ตัวอย่าง (ไม่ต้องต่อรถ)</button>"
     "<p id=rst class=s></p>"
     "<div id=rout></div>"
+    "<hr class=sep>"
+    "<h3 class=h>รหัสปัญหา (DTC)</h3>"
+    "<p class=s>อ่านอย่างเดียว · ไม่ล้างรหัส · แสดงเฉพาะรหัส ยังไม่มีคำอธิบาย</p>"
+    "<button id=dgo class=btn>อ่าน DTC</button>"
+    "<p id=dst class=s></p>"
+    "<div id=dout></div>"
+    "<a id=dsave class=lnk style=display:none>บันทึกข้อมูลดิบ (JSON)</a>"
     "</div>"
     "<div class=s>BT <span class=dot id=dot></span> &middot; poll #<span id=seq>0</span></div>"
     "<div id=tabs></div>"
@@ -853,6 +994,8 @@ static void http_start(void)
     httpd_uri_t data  = {.uri = "/data",      .method = HTTP_GET, .handler = data_get_handler};
     httpd_uri_t rep   = {.uri = "/report",    .method = HTTP_GET, .handler = report_get_handler};
     httpd_uri_t repjs = {.uri = "/report.js", .method = HTTP_GET, .handler = reportjs_get_handler};
+    httpd_uri_t dtc   = {.uri = "/dtc",       .method = HTTP_GET, .handler = dtc_get_handler};
+    httpd_register_uri_handler(server, &dtc);
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &data);
     httpd_register_uri_handler(server, &rep);

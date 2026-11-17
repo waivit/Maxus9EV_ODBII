@@ -324,4 +324,89 @@
 
   $('rgo').onclick = function () { run(false); };
   $('rdemo').onclick = function () { run(true); };
+
+  /* ------------------------- DTC read (H9) ------------------------- */
+  /* Shown on the phone only, not on the report image (Design has not
+   * decided). Codes only: no descriptions yet. */
+
+  var OBD_MODE = { '03': 'รหัสที่บันทึกไว้', '07': 'รหัสที่รอยืนยัน', '0A': 'รหัสถาวร' };
+  /* UDS status byte (ISO 14229): the bits a reader cares about first. */
+  var STATUS_BITS = [[3, 'ยืนยันแล้ว'], [2, 'รอยืนยัน'], [0, 'เกิดในการทดสอบล่าสุด'],
+                     [7, 'สั่งไฟเตือน']];
+
+  function esc(t) {
+    return String(t).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  function hex2(n) { return pad(Number(n).toString(16).toUpperCase(), 2); }
+  function statusText(h) {
+    var s = parseInt(h, 16), out = [];
+    STATUS_BITS.forEach(function (b) { if (s & (1 << b[0])) out.push(b[1]); });
+    return (out.length ? out.join(' · ') : 'เคยเกิด') + ' (สถานะ ' + h + ')';
+  }
+
+  function renderDtc(d) {
+    var html = '<h4>OBD มาตรฐาน (ทุก ECU ที่ตอบ)</h4>';
+    (d.obd || []).forEach(function (m) {
+      var head = OBD_MODE[m.mode] + ' (' + m.mode + ')';
+      if (!m.ecus.length) {
+        html += '<div class=row>' + esc(head) + ': <span class=mut>ไม่มี ECU ตอบ</span></div>';
+        return;
+      }
+      m.ecus.forEach(function (e) {
+        var body;
+        if (e.dtcs) body = e.dtcs.length ?
+          e.dtcs.map(function (c) { return '<span class=code>' + esc(c) + '</span>'; }).join(' ') :
+          '<span class=mut>ไม่มีรหัส</span>';
+        else if (e.nrc !== undefined) body = '<span class=mut>ไม่รองรับ (NRC 0x' + hex2(e.nrc) + ')</span>';
+        else body = '<span class=mut>คำตอบอ่านไม่ออก</span>';
+        html += '<div class=row>' + esc(head) + ' · ECU ' + esc(e.id) + ': ' + body + '</div>';
+      });
+    });
+    html += '<h4>ราย ECU (UDS)</h4>';
+    (d.uds || []).forEach(function (u) {
+      var head = esc(u.name) + ' (' + esc(u.ecu) + ')';
+      var body;
+      if (!u.answered) body = '<span class=mut>ไม่ตอบ</span>';
+      else if (u.dtcs) body = u.dtcs.length ? u.dtcs.map(function (c) {
+          return '<div><span class=code>' + esc(c.code) + '</span> <span class=mut>' +
+                 esc(statusText(c.status)) + '</span></div>';
+        }).join('') : '<span class=mut>ไม่มีรหัส</span>';
+      else if (u.nrc !== undefined) body = '<span class=mut>ไม่รองรับ (NRC 0x' + hex2(u.nrc) + ')</span>';
+      else body = '<span class=mut>คำตอบอ่านไม่ออก</span>';
+      html += '<div class=row>' + head + ': ' + body + '</div>';
+    });
+    $('dout').innerHTML = html;
+  }
+
+  var dtcUrl = null;
+  function offerDtcJson(d) {
+    var when = new Date();
+    d.read_at = when.toISOString();
+    if (dtcUrl) URL.revokeObjectURL(dtcUrl);
+    dtcUrl = URL.createObjectURL(new Blob([JSON.stringify(d, null, 1)], { type: 'application/json' }));
+    var a = $('dsave');
+    a.href = dtcUrl;
+    a.download = 'dtc-' + when.getFullYear() + pad(when.getMonth() + 1, 2) + pad(when.getDate(), 2) +
+                 '-' + pad(when.getHours(), 2) + pad(when.getMinutes(), 2) + '.json';
+    a.style.display = 'inline-block';
+  }
+
+  $('dgo').onclick = function () {
+    $('dgo').disabled = true;
+    $('dout').innerHTML = '';
+    $('dsave').style.display = 'none';
+    $('dst').textContent = 'กำลังอ่าน DTC… (ราว 10–20 วินาที)';
+    fetch('/dtc', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) { $('dst').textContent = ERRORS[d.err] || 'อ่าน DTC ไม่ได้'; return; }
+        renderDtc(d);
+        offerDtcJson(d);
+        $('dst').textContent = 'พบ ' + d.total + ' รหัส · ข้อมูลนี้ไม่อยู่ในภาพรายงาน';
+      })
+      .catch(function () { $('dst').textContent = 'เชื่อมต่ออุปกรณ์ไม่ได้ · ตรวจว่ามือถือยังต่อ WiFi MaxusBridge'; })
+      .then(function () { $('dgo').disabled = false; });
+  };
 })();

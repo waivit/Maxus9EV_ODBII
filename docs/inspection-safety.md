@@ -16,8 +16,8 @@ The design is **fail-closed**: anything not explicitly listed is blocked. That
 includes malformed input and commands added later by mistake. A blocked command
 is never sent. It is logged as `BLOCKED` on the serial console.
 
-Decided by the user on 2026-11-17: **ELM327 only** (no native-CAN board), and
-DTC reading stays **blocked** for now.
+Decided by the user on 2026-11-17: **ELM327 only** (no native-CAN board).
+DTC reading was blocked at first and then opened the same day (see below).
 
 ## Allowed
 
@@ -43,13 +43,17 @@ checked:
 | `01` (OBD current data) | yes | — |
 | `09` (OBD vehicle info) | yes | `09 02` (VIN) |
 | `22` (UDS ReadDataByIdentifier) | yes | DID `F190` (VIN) |
+| `03` `07` `0A` (OBD stored / pending / permanent DTCs) | yes, exactly one byte | anything appended |
+| `19` (UDS ReadDTCInformation) | only `19 01 <mask>`, `19 02 <mask>`, `19 0A` | every other sub-function |
+
+DTC reading was opened by the user on 2026-11-17 (H9), after first being
+blocked. All of the above **read** codes. Nothing that clears them is allowed.
 
 ## Blocked (examples, not exhaustive — everything else is blocked too)
 
 | Command | Why |
 | --- | --- |
-| `04`, `14` | clear diagnostic codes |
-| `03`, `19` | read DTCs. Read-only, but blocked until there is a need (user, 2026-11-17) |
+| `04`, `14` | clear diagnostic codes. **Never**, because that destroys the car's evidence |
 | `10` | diagnostic session control (the gate to writes) |
 | `11` | ECU reset |
 | `27` | security access |

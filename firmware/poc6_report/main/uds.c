@@ -180,6 +180,170 @@ uds_result_t uds_parse_id(const char *raw, int idl)
     return r;
 }
 
+/* ===================== multi-ECU collection (H9) ===================== */
+
+typedef struct { int total, next_sn; bool active, done; } isotp_asm_t;
+
+int isotp_collect(const char *raw, int idl, isotp_msg_t *out, int max)
+{
+    if ((idl != 3 && idl != 8) || max <= 0) return 0;
+    if (max > ISOTP_COLLECT_MAX) max = ISOTP_COLLECT_MAX;
+    const size_t idz = (size_t)idl;
+    const size_t mf_frame_chars = idz + 16;
+    isotp_asm_t st[ISOTP_COLLECT_MAX];
+    memset(st, 0, sizeof(st));
+    int used = 0;
+
+    const char *t = raw;
+    while (*t) {
+        while (*t && isspace((unsigned char)*t)) t++;
+        const char *start = t;
+        bool all_hex = true;
+        while (*t && !isspace((unsigned char)*t)) {
+            if (hexnib(*t) < 0) all_hex = false;
+            t++;
+        }
+        size_t tlen = (size_t)(t - start);
+        if (tlen == 0 || !all_hex) continue;
+
+        size_t pos = 0;
+        while (tlen - pos >= idz + 2) {
+            const char *f = start + pos;
+            const char *p = f + idz;
+            size_t rem = tlen - pos;
+            int pci = hexnib(p[0]);
+            size_t flen;
+            if (pci == 0) {
+                flen = idz + 2 + 2 * (size_t)hexnib(p[1]);
+                if (flen > rem) flen = rem;
+            } else {
+                flen = rem < mf_frame_chars ? rem : mf_frame_chars;
+            }
+            pos += flen;
+
+            if (pci == 0 || pci == 1) {                  /* a new message starts */
+                if (used >= max) continue;
+                int k = used++;
+                memset(&out[k], 0, sizeof(out[k]));
+                memcpy(out[k].id, f, idz);
+                st[k] = (isotp_asm_t){0};
+                if (pci == 0) {
+                    out[k].len = take_bytes(p + 2, flen - idz - 2, out[k].data, hexnib(p[1]));
+                    st[k].done = true;
+                } else if (flen >= idz + 4) {
+                    st[k].total = (hexnib(p[1]) << 8) | hexbyte(p + 2);
+                    if (st[k].total > ISOTP_MSG_MAX) st[k].total = ISOTP_MSG_MAX;
+                    out[k].len = take_bytes(p + 4, flen - idz - 4, out[k].data,
+                                            st[k].total < 6 ? st[k].total : 6);
+                    st[k].next_sn = 1;
+                    st[k].active = true;
+                } else {
+                    used--;                              /* malformed first frame */
+                    continue;
+                }
+            } else if (pci == 2) {                       /* continue this id's message */
+                for (int k = used - 1; k >= 0; k--) {
+                    if (!st[k].active || memcmp(out[k].id, f, idz) != 0) continue;
+                    int sn = hexnib(p[1]);
+                    if (sn != st[k].next_sn) {           /* lost a frame: abandon it */
+                        st[k].active = false;
+                        break;
+                    }
+                    int want = st[k].total - out[k].len;
+                    if (want > 7) want = 7;
+                    out[k].len += take_bytes(p + 2, flen - idz - 2, out[k].data + out[k].len, want);
+                    st[k].next_sn = (st[k].next_sn + 1) & 0xF;
+                    if (out[k].len >= st[k].total) { st[k].active = false; st[k].done = true; }
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Keep only complete messages, and drop responsePending (7F xx 78). */
+    int n = 0;
+    for (int k = 0; k < used; k++) {
+        if (!st[k].done) continue;
+        if (out[k].len >= 3 && out[k].data[0] == 0x7F && out[k].data[2] == 0x78) continue;
+        if (n != k) out[n] = out[k];
+        n++;
+    }
+    return n;
+}
+
+void dtc_format(uint8_t hi, uint8_t lo, char out[6])
+{
+    static const char LETTER[] = "PCBU";
+    static const char HX[] = "0123456789ABCDEF";
+    out[0] = LETTER[hi >> 6];
+    out[1] = HX[(hi >> 4) & 0x3];
+    out[2] = HX[hi & 0xF];
+    out[3] = HX[lo >> 4];
+    out[4] = HX[lo & 0xF];
+    out[5] = '\0';
+}
+
+/* Synthetic replies only: no DTC reply has been captured on any car yet. */
+static int dtc_selftest(int *total)
+{
+    int fails = 0;
+    static isotp_msg_t m[ISOTP_COLLECT_MAX];
+    char code[6];
+
+    /* dtc_format: one code per letter class */
+    struct { uint8_t a, b; const char *want; } F[] = {
+        {0x01, 0x33, "P0133"}, {0x0A, 0x80, "P0A80"}, {0x41, 0x23, "C0123"},
+        {0x81, 0x23, "B0123"}, {0xC1, 0x23, "U0123"}, {0xFF, 0xFF, "U3FFF"},
+    };
+    for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+        dtc_format(F[i].a, F[i].b, code);
+        (*total)++;
+        if (strcmp(code, F[i].want) != 0) {
+            fails++;
+            ESP_LOGE(TAG, "dtc selftest FAIL: %02X%02X -> %s, want %s", F[i].a, F[i].b, code, F[i].want);
+        }
+    }
+
+    /* Two ECUs answer a functional 03: one DTC from 7E8, none from 7EA. */
+    int n = isotp_collect("7E80443010133 7EA024300", 3, m, ISOTP_COLLECT_MAX);
+    (*total)++;
+    if (!(n == 2 && strcmp(m[0].id, "7E8") == 0 && m[0].len == 4 && m[0].data[0] == 0x43 &&
+          m[0].data[1] == 1 && m[0].data[2] == 0x01 && m[0].data[3] == 0x33 &&
+          strcmp(m[1].id, "7EA") == 0 && m[1].len == 2 && m[1].data[1] == 0)) {
+        fails++;
+        ESP_LOGE(TAG, "dtc selftest FAIL: functional 03 from two ECUs (n=%d)", n);
+    }
+
+    /* UDS 19 02 FF, multi-frame: 59 02 FF + P0A80-00 st 2F + U0123-45 st 09 */
+    n = isotp_collect("7ED100B5902FF0A8000 7ED212FC1234509AAAA", 3, m, ISOTP_COLLECT_MAX);
+    (*total)++;
+    if (!(n == 1 && m[0].len == 11 && m[0].data[0] == 0x59 && m[0].data[3] == 0x0A &&
+          m[0].data[6] == 0x2F && m[0].data[7] == 0xC1 && m[0].data[10] == 0x09)) {
+        fails++;
+        ESP_LOGE(TAG, "dtc selftest FAIL: 19 02 multi-frame (n=%d len=%d)", n, n ? m[0].len : -1);
+    }
+
+    /* responsePending, then the real (negative) answer: only the NRC 0x11 remains */
+    n = isotp_collect("7ED037F1978 7ED037F1911", 3, m, ISOTP_COLLECT_MAX);
+    (*total)++;
+    if (!(n == 1 && m[0].data[0] == 0x7F && m[0].data[2] == 0x11)) {
+        fails++;
+        ESP_LOGE(TAG, "dtc selftest FAIL: 0x78 then NRC 0x11 (n=%d)", n);
+    }
+
+    /* Interleaved multi-frame from two ECUs (8-byte payloads: 43 03 + 3 DTCs);
+     * a first frame always carries 6 data bytes. */
+    n = isotp_collect("7E81008430301010202 7E91008430304040505 "
+                      "7E8210333AAAAAAAAAA 7E9210644AAAAAAAAAA",
+                      3, m, ISOTP_COLLECT_MAX);
+    (*total)++;
+    if (!(n == 2 && m[0].len == 8 && m[1].len == 8 && m[0].data[7] == 0x33 && m[1].data[7] == 0x44)) {
+        fails++;
+        ESP_LOGE(TAG, "dtc selftest FAIL: interleaved ECUs (n=%d)", n);
+    }
+    return fails;
+}
+
 /* ============================== self-test ============================== */
 
 typedef struct {
@@ -245,6 +409,10 @@ int uds_selftest(void)
         ESP_LOGI(TAG, "selftest %-4s %s -> pos=%d did=%s data=%s nrc=%d",
                  ok ? "ok" : "FAIL", c->label, r.positive, r.did, hex, r.nrc_code);
     }
+    int dtc_total = 0;
+    int dtc_fails = dtc_selftest(&dtc_total);
+    fails += dtc_fails;
+    total += dtc_total;
     ESP_LOGI(TAG, "uds selftest: %d/%d PASS (regression guard, not a vehicle test)",
              total - fails, total);
     return fails;

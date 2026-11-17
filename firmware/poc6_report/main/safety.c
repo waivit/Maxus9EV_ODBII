@@ -78,7 +78,20 @@ static int parse_hex(const char *s, uint8_t *out, int max)
 
 static bool request_allowed(const uint8_t *b, int n)
 {
-    if (n < 2 || n > REQ_MAX_LEN) return false;
+    if (n < 1 || n > REQ_MAX_LEN) return false;
+    switch (b[0]) {
+    case 0x03:                         /* OBD stored DTCs     (read-only)  */
+    case 0x07:                         /* OBD pending DTCs    (read-only)  */
+    case 0x0A:                         /* OBD permanent DTCs  (read-only)  */
+        return n == 1;
+    case 0x19:                         /* UDS ReadDTCInformation, reads only */
+        if (n == 3 && (b[1] == 0x01 || b[1] == 0x02)) return true;   /* by status mask */
+        if (n == 2 && b[1] == 0x0A) return true;                     /* supported DTCs */
+        return false;
+    default:
+        break;
+    }
+    if (n < 2) return false;
     switch (b[0]) {
     case 0x01:                         /* OBD current data                 */
         return true;
@@ -152,14 +165,17 @@ static const char *ALLOWED_CASES[] = {
     "ATSH 7E5", "ATCRA 7ED", "ATCF 7E8", "ATCM 7F8", "ATCSM1", "ATMA", "ATDPN",
     "ATRV", "ATI", "atsh 7e5", "ATSH7E5",
     "01 0C", "0100", "22 B0 61", "22 B0 61 B0 62", "09 04", "09 00",
+    /* DTC reads, opened 2026-11-17 (H9) */
+    "03", "07", "0A", "19 02 FF", "19 01 FF", "19 0A", "ATSH 7DF", "ATCRA",
 };
 
 static const char *BLOCKED_CASES[] = {
     /* services that change or clear things */
     "04", "14 FF FF FF", "10 03", "11 01", "27 01", "2E B4 80 02", "2F 01 02 03",
     "31 01 FF 00", "3E 00", "28 03 01", "85 02", "34 00 44",
-    /* DTC reading: blocked until the DTC step (H9) */
-    "03", "07", "0A", "19 02 FF",
+    /* DTC: only the exact read forms pass; clearing never does */
+    "03 00", "07 01", "0A 00", "19 02", "19 02 FF 00", "19 04 0A 80 00 FF",
+    "19 06 0A 80 00 FF", "19 14", "14 FF FF", "04 00",
     /* VIN requests */
     "22 F1 90", "22 B0 61 F1 90", "09 02",
     /* adapter commands that transmit, write, or change the link */

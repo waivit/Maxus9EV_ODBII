@@ -81,9 +81,23 @@ idf.py build flash monitor
 **ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and
 no report number. Use it at the desk to check the layout.
 
+### DTC read (H9, testing)
+On the **รายงาน** tab, below the report, **อ่าน DTC** reads the trouble codes
+(read-only, never clears):
+- OBD `03` / `07` / `0A` (stored, pending, permanent), sent functionally on `7DF`,
+  so every ECU that answers is listed;
+- UDS `19 02 FF` on the BMS `7E5`, the IMCU `7E3` and the CCU `7E4`, with the
+  failure type and status flags (confirmed, pending, ...).
+
+The result shows codes only, with no descriptions, and **is not on the report
+image**. **บันทึกข้อมูลดิบ (JSON)** saves the raw answers to the phone. The ECU
+list is MAXUS-specific until per-model profiles arrive.
+
 ### Read-only safety gate (from 1.0.0)
 Every command to the ELM327 passes an allowlist in `main/safety.c`. Only adapter
-setup and the read services `01`, `09` and `22` get through, never a VIN request.
+setup and the read services get through: `01`, `09` and `22`, plus the DTC reads
+`03`, `07`, `0A` and `19 01/02/0A`. A VIN request never gets through, and
+neither does clearing codes.
 Anything else is refused and logged as `BLOCKED`. Replies are scrubbed of
 VIN-like data before they are stored or shown. If either boot self-test fails,
 the device does not connect to the car. Policy and limits:

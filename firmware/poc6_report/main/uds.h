@@ -36,6 +36,26 @@ uds_result_t uds_parse_id(const char *raw, int id_chars);
  * number of failures. A regression guard for the parser, not a vehicle test. */
 int uds_selftest(void);
 
+/* ---- Multi-ECU collection (DTC reads, H9) -------------------------------
+ * A functional request (7DF) can be answered by several ECUs, each with its
+ * own single- or multi-frame reply, possibly interleaved. isotp_collect()
+ * reassembles every complete message per CAN id. responsePending (7F xx 78)
+ * messages are dropped, so the real answer that follows is kept. */
+#define ISOTP_MSG_MAX     256   /* bytes per reassembled message */
+#define ISOTP_COLLECT_MAX 8     /* messages per reply            */
+
+typedef struct {
+    char    id[9];              /* response CAN id as hex text, e.g. "7ED" */
+    uint8_t data[ISOTP_MSG_MAX];
+    int     len;
+} isotp_msg_t;
+
+/* Returns the number of complete messages written to out (<= max). */
+int isotp_collect(const char *raw, int id_chars, isotp_msg_t *out, int max);
+
+/* Two DTC bytes -> "P0A80" (letter P/C/B/U from bits 7-6, then 4 digits). */
+void dtc_format(uint8_t hi, uint8_t lo, char out[6]);
+
 /* INT16 = data[0]*256 + data[1] (matches src/pids.py). */
 static inline int uds_int16(const uds_result_t *r)
 {

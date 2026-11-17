@@ -219,7 +219,7 @@ every mode is **read-only**.
 | Stage | Work | Status |
 | --- | --- | --- |
 | 1 | Safety gate: command allowlist, VIN scrub, 29-bit CAN parsing, version `1.0.0`, JPEG ≤ 2 MB | desk ✅ (self-tests 14/14 + 66/66) · car pending (H8) |
-| 1b | DTC reading (`03 07 0A`, `19 01/02/0A`), opened at the user's request | next (H9) |
+| 1b | DTC reading (`03 07 0A` on `7DF`, `19 02 FF` on `7E5/7E3/7E4`), opened at the user's request. Shown on the phone with a raw JSON download, not on the report image | desk ✅ (self-tests 24/24 + 80/80, synthetic replies) · car pending (H9) |
 | 2 | Per-model profiles as JSON files on the device, reduced report, warning when the car is not at rest | planned |
 | 3 | Discovery mode: find ECUs, identification DIDs (no VIN), Mode 01, bounded DID sweep, raw log tied to the report number | planned |
 | 4 | Listen-only (`ATMA` + `ATCSM1`), time-boxed | planned |

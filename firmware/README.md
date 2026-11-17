@@ -73,6 +73,15 @@ idf.py build flash monitor
 **ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and
 no report number. Use it at the desk to check the layout.
 
+### Status LED (onboard, GPIO2 / "D2")
+| LED | Meaning |
+| --- | --- |
+| slow blink, 1 per second | looking for / connecting to the ELM327 |
+| double blip every second | ELM327 connected but the car answers nothing (not READY?) |
+| solid on | reading live values |
+| fast blink, 5 per second | reading the car for a report |
+| 3 quick blinks | report issued |
+
 ### Desk check
 The boot log must show `uds selftest: N/N PASS`. That is a **regression guard** built
 from captured bytes. It is not a verification against the car.

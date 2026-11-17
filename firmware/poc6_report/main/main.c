@@ -33,6 +33,7 @@
 #include "esp_http_server.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/gpio.h"
 #include "uds.h"
 
 static const char *TAG = "poc6_rep";
@@ -222,6 +223,53 @@ static SemaphoreHandle_t s_elm_mutex;
 static char              s_cur_hdr[8];
 static volatile bool     s_elm_ready;   /* init sequence done on this link */
 
+/* ============================ Status LED ============================ */
+/* Onboard LED (DevKit "D2" = GPIO2). GPIO2 is a strapping pin, but it is only
+ * driven after boot, so download mode is unaffected. Lets the user read the
+ * device state at the car without opening the phone. */
+#define LED_GPIO GPIO_NUM_2
+
+typedef enum {
+    LED_SEARCHING,    /* no ELM327 link yet          : slow blink, 1 Hz       */
+    LED_NO_ANSWER,    /* ELM327 up, car answers none : double blip every 1 s  */
+    LED_OK,           /* polling with live values    : solid on               */
+    LED_REPORTING,    /* /report reading the car     : fast blink, 5 Hz       */
+} led_state_t;
+
+static volatile led_state_t s_led_state = LED_SEARCHING;
+static volatile bool        s_led_done;   /* report issued: 3 quick blinks */
+
+static void led_task(void *arg)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    uint32_t t = 0;                                   /* 50 ms ticks */
+    for (;;) {
+        if (s_led_done) {
+            s_led_done = false;
+            gpio_set_level(LED_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            for (int i = 0; i < 3; i++) {
+                gpio_set_level(LED_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(150));
+                gpio_set_level(LED_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(150));
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
+            t = 0;
+            continue;
+        }
+        int on, p = (int)(t % 20);
+        switch (s_led_state) {
+        case LED_SEARCHING: on = p < 10;                          break;
+        case LED_NO_ANSWER: on = p < 2 || (p >= 4 && p < 6);      break;
+        case LED_REPORTING: on = (t % 4) < 2;                     break;
+        default:            on = 1;                               break;
+        }
+        gpio_set_level(LED_GPIO, on);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        t++;
+    }
+}
+
 /* --- BT discovery/connect state --- */
 static bool s_target_found = false;
 static esp_bd_addr_t s_target_bda;
@@ -378,6 +426,7 @@ static void poll_task(void *arg)
 
         int ok_count = 0;
         for (size_t i = 0; i < N_PIDS; i++) if (local[i].valid) ok_count++;
+        s_led_state = ok_count ? LED_OK : LED_NO_ANSWER;
         ESP_LOGI(TAG, "[poll #%lu] %d/%d ok | PackV=%s SOCraw=%s | heap=%lu",
                  (unsigned long)seq, ok_count, (int)N_PIDS,
                  local[1].text, local[8].text,
@@ -386,6 +435,7 @@ static void poll_task(void *arg)
     }
 
     s_elm_ready = false;
+    s_led_state = LED_SEARCHING;
     xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
     g_bt_connected = false;
     xSemaphoreGive(s_snap_mutex);
@@ -470,6 +520,8 @@ static esp_err_t report_get_handler(httpd_req_t *req)
          * moment; the dashboard poller waits (at most one read in flight). */
         if (xSemaphoreTake(s_elm_mutex, pdMS_TO_TICKS(5000)) != pdTRUE)
             return send_json(req, "{\"ok\":false,\"err\":\"busy\"}");
+        led_state_t led_before = s_led_state;
+        s_led_state = LED_REPORTING;
         for (size_t i = 0; i < N_REPORT; i++) {
             for (int attempt = 0; attempt < 2; attempt++) {   /* one retry */
                 uds_result_t r = elm_read(REPORT[i].header, REPORT[i].cmd);
@@ -480,6 +532,7 @@ static esp_err_t report_get_handler(httpd_req_t *req)
                      vals[i].ok ? "ok  " : "FAIL", vals[i].raw);
             if (vals[i].ok) ok_count++;
         }
+        s_led_state = led_before;
         xSemaphoreGive(s_elm_mutex);
         if (ok_count == 0) return send_json(req, "{\"ok\":false,\"err\":\"novalues\"}");
     }
@@ -487,6 +540,7 @@ static esp_err_t report_get_handler(httpd_req_t *req)
     /* Only a real report with at least one value consumes a number. */
     uint32_t seq = demo ? 0 : report_counter_next();
     if (!demo && seq == 0) return send_json(req, "{\"ok\":false,\"err\":\"nvs\"}");
+    if (!demo) s_led_done = true;            /* 3 quick blinks: report issued */
 
     static char json[1536];
     size_t o = 0;
@@ -769,6 +823,7 @@ void app_main(void)
     ESP_LOGI(TAG, " %s (%d PIDs, %d report values)", FW_VERSION, (int)N_PIDS, (int)N_REPORT);
     ESP_LOGI(TAG, "==============================");
     uds_selftest();
+    xTaskCreate(led_task, "led", 2048, NULL, 2, NULL);
 
     s_snap_mutex = xSemaphoreCreateMutex();
     s_elm_mutex = xSemaphoreCreateMutex();

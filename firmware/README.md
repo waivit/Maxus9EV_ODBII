@@ -140,6 +140,23 @@ VIN-like data before they are stored or shown. If either boot self-test fails,
 the device does not connect to the car. Policy and limits:
 [`../docs/inspection-safety.md`](../docs/inspection-safety.md).
 
+### Bluetooth: scan and the connect button
+WiFi and Bluetooth share one radio on the ESP32, and searching for the ELM327
+takes most of it. So when no ELM327 answers, the board scans for about 6 s, then
+waits 5, 10, 20 and then 30 s between scans (30 s from then on), which keeps the
+phone's WiFi usable at the desk. Plugging in the ELM327 later can therefore take
+up to about 40 s to be found, unless you press the button.
+
+The line under the page shows the state next to the BT dot (กำลังค้นหา…,
+ค้นหาใหม่ใน N วิ, กำลังเชื่อมต่อ…, เชื่อมต่อแล้ว, ไม่ได้เชื่อมต่อ). The
+**เชื่อมต่อ Bluetooth** button starts a scan now and resets the waits. It is
+off while connected or while a scan or connect is running, unless that has hung
+for 20 s.
+
+A failed connect or a dropped link is **not retried automatically**. The state
+becomes ไม่ได้เชื่อมต่อ and you press the button. The button only runs the
+Bluetooth search and connect. It sends nothing to the car.
+
 ### Status LED (onboard, GPIO2 / "D2")
 | LED | Meaning |
 | --- | --- |

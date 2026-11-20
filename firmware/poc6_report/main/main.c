@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_bt.h"
@@ -303,6 +304,95 @@ static esp_bd_addr_t s_target_bda;
 static volatile uint32_t s_spp_handle = 0;
 static StreamBufferHandle_t s_rx_stream;
 static TaskHandle_t s_poll_task = NULL;
+
+/* WiFi and BT share one radio, and an inquiry scan takes most of its airtime.
+ * So when no ELM327 answers, scan briefly and back off between scans, which
+ * keeps the phone's WiFi usable at the desk. A failed connect or a dropped
+ * link is not retried automatically: the page's "เชื่อมต่อ Bluetooth" button
+ * (/bt/connect) starts a new scan on demand. */
+typedef enum {
+    BT_OFF,           /* bt_init not run (boot self-test failed)        */
+    BT_IDLE,          /* nothing running: connect failed or link closed */
+    BT_SCANNING,      /* inquiry in progress                            */
+    BT_WAITING,       /* backing off until the next scan                */
+    BT_CONNECTING,    /* ELM327 found: SDP lookup + SPP connect         */
+    BT_CONNECTED,
+} bt_phase_t;
+
+#define SCAN_LEN         5      /* inquiry length, 1.28 s units = 6.4 s      */
+#define BT_STUCK_MS      20000  /* scan/connect this old counts as stuck     */
+static const uint16_t SCAN_PAUSE_S[] = {5, 10, 20, 30};   /* then 30 s each */
+#define N_PAUSE (sizeof(SCAN_PAUSE_S) / sizeof(SCAN_PAUSE_S[0]))
+
+typedef enum { SCAN_BOOT, SCAN_TIMER, SCAN_MANUAL } scan_why_t;
+
+static portMUX_TYPE        s_bt_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bt_phase_t s_bt_phase = BT_OFF;
+static volatile TickType_t s_bt_since;    /* tick when the phase began        */
+static volatile TickType_t s_bt_next;     /* BT_WAITING: tick of the next scan */
+static unsigned            s_scan_miss;   /* scans in a row without an ELM327 */
+static TimerHandle_t       s_scan_timer;
+
+static void bt_set_phase(bt_phase_t p)
+{
+    portENTER_CRITICAL(&s_bt_mux);
+    s_bt_phase = p;
+    s_bt_since = xTaskGetTickCount();
+    portEXIT_CRITICAL(&s_bt_mux);
+}
+
+/* Start an inquiry if the current phase allows it. The timer only ends a
+ * back-off wait. The button also starts over from idle, or from a scan or
+ * connect that has hung for BT_STUCK_MS, and resets the back-off. */
+static bool bt_button_ok(bt_phase_t p, TickType_t now, TickType_t since)
+{
+    bool stuck = (p == BT_SCANNING || p == BT_CONNECTING) &&
+                 (now - since) > pdMS_TO_TICKS(BT_STUCK_MS);
+    return p == BT_IDLE || p == BT_WAITING || stuck;
+}
+
+static bool bt_begin_scan(scan_why_t why)
+{
+    bool go;
+    portENTER_CRITICAL(&s_bt_mux);
+    TickType_t now = xTaskGetTickCount();
+    bt_phase_t p = s_bt_phase;
+    if (why == SCAN_BOOT)       go = true;
+    else if (why == SCAN_TIMER) go = p == BT_WAITING;
+    else                        go = bt_button_ok(p, now, s_bt_since);
+    if (go) {
+        if (why != SCAN_TIMER) s_scan_miss = 0;
+        s_target_found = false;
+        s_bt_phase = BT_SCANNING;
+        s_bt_since = now;
+    }
+    portEXIT_CRITICAL(&s_bt_mux);
+    if (!go) return false;
+
+    if (why == SCAN_MANUAL) xTimerStop(s_scan_timer, 0);
+    ESP_LOGI(TAG, "BT scan (~%d s, %s)...", (SCAN_LEN * 128 + 50) / 100,
+             why == SCAN_BOOT ? "boot" : why == SCAN_TIMER ? "retry" : "button");
+    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, SCAN_LEN, 0);
+    return true;
+}
+
+static void scan_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    bt_begin_scan(SCAN_TIMER);
+}
+
+/* No ELM327 in this scan: wait 5, 10, 20, then 30 s before the next one. */
+static void bt_schedule_rescan(void)
+{
+    unsigned i = s_scan_miss < N_PAUSE ? s_scan_miss : N_PAUSE - 1;
+    if (s_scan_miss < 1000) s_scan_miss++;
+    TickType_t wait = pdMS_TO_TICKS(SCAN_PAUSE_S[i] * 1000u);
+    s_bt_next = xTaskGetTickCount() + wait;
+    bt_set_phase(BT_WAITING);
+    xTimerChangePeriod(s_scan_timer, wait, 0);   /* also starts the timer */
+    ESP_LOGW(TAG, "No ELM327 found - next scan in %u s", SCAN_PAUSE_S[i]);
+}
 
 /* ============================ ELM327 over SPP ============================ */
 
@@ -894,13 +984,14 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     }
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
         if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+            if (s_bt_phase != BT_SCANNING) break;   /* superseded by the button */
             if (s_target_found) {
                 ESP_LOGI(TAG, "Discovery done. SPP SDP lookup...");
+                s_scan_miss = 0;
+                bt_set_phase(BT_CONNECTING);
                 esp_spp_start_discovery(s_target_bda);
             } else {
-                ESP_LOGW(TAG, "No ELM327 found - rescanning in 3 s...");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+                bt_schedule_rescan();
             }
         }
         break;
@@ -919,8 +1010,8 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 {
     switch (event) {
     case ESP_SPP_INIT_EVT:
-        ESP_LOGI(TAG, "SPP init. Scanning ~10 s for the ELM327...");
-        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+        ESP_LOGI(TAG, "SPP init. Looking for the ELM327...");
+        bt_begin_scan(SCAN_BOOT);
         break;
     case ESP_SPP_DISCOVERY_COMP_EVT:
         if (param->disc_comp.status == ESP_SPP_SUCCESS && param->disc_comp.scn_num > 0) {
@@ -929,10 +1020,18 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
             esp_spp_connect(ESP_SPP_SEC_AUTHENTICATE | ESP_SPP_SEC_ENCRYPT,
                             ESP_SPP_ROLE_MASTER, param->disc_comp.scn[0], s_target_bda);
         } else {
-            ESP_LOGE(TAG, "No SPP service (status=%d)", param->disc_comp.status);
+            ESP_LOGE(TAG, "No SPP service (status=%d) - press เชื่อมต่อ Bluetooth to retry",
+                     param->disc_comp.status);
+            if (s_bt_phase == BT_CONNECTING) bt_set_phase(BT_IDLE);
         }
         break;
     case ESP_SPP_OPEN_EVT:
+        if (param->open.status != ESP_SPP_SUCCESS) {
+            ESP_LOGE(TAG, "SPP connect failed (status=%d)", param->open.status);
+            if (s_bt_phase == BT_CONNECTING) bt_set_phase(BT_IDLE);
+            break;
+        }
+        bt_set_phase(BT_CONNECTED);
         s_spp_handle = param->open.handle;
         ESP_LOGI(TAG, "BT connected (handle=%lu). Starting poll task...",
                  (unsigned long)s_spp_handle);
@@ -940,9 +1039,13 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
             xTaskCreate(poll_task, "elm_poll", 6144, NULL, 5, &s_poll_task);
         break;
     case ESP_SPP_CLOSE_EVT:
-        ESP_LOGW(TAG, "BT link closed.");
+        ESP_LOGW(TAG, "BT link closed (no auto-retry; use เชื่อมต่อ Bluetooth).");
         s_elm_ready = false;
         s_spp_handle = 0;
+        /* A close can also end a failed connect. Leave a scan the button
+         * already started alone. */
+        if (s_bt_phase == BT_CONNECTING || s_bt_phase == BT_CONNECTED)
+            bt_set_phase(BT_IDLE);
         break;
     case ESP_SPP_DATA_IND_EVT:
         xStreamBufferSend(s_rx_stream, param->data_ind.data, param->data_ind.len, 0);
@@ -954,6 +1057,9 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 
 static void bt_init(void)
 {
+    s_scan_timer = xTimerCreate("bt_scan", pdMS_TO_TICKS(1000), pdFALSE, NULL, scan_timer_cb);
+    ESP_ERROR_CHECK(s_scan_timer ? ESP_OK : ESP_ERR_NO_MEM);
+    bt_set_phase(BT_IDLE);
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
@@ -982,9 +1088,23 @@ static esp_err_t data_get_handler(httpd_req_t *req)
 {
     static char json[8192];                  /* ~41 PIDs x ~170 chars */
     size_t o = 0;
+    /* BT phase for the status line: off/idle/scan/wait/conn/ok, plus the
+     * seconds left before the next scan while waiting. */
+    static const char *const BTS[] = {"off", "idle", "scan", "wait", "conn", "ok"};
+    portENTER_CRITICAL(&s_bt_mux);
+    TickType_t now = xTaskGetTickCount();
+    bt_phase_t ph = s_bt_phase;
+    bool btb = bt_button_ok(ph, now, s_bt_since);
+    long btw = 0;
+    if (ph == BT_WAITING) {
+        long left = (long)(s_bt_next - now);
+        btw = left > 0 ? (left * portTICK_PERIOD_MS + 999) / 1000 : 0;
+    }
+    portEXIT_CRITICAL(&s_bt_mux);
     xSemaphoreTake(s_snap_mutex, portMAX_DELAY);
-    APPEND(json, o, "{\"bt\":%s,\"seq\":%lu,\"pids\":[",
-           g_bt_connected ? "true" : "false", (unsigned long)g_seq);
+    APPEND(json, o, "{\"bt\":%s,\"bts\":\"%s\",\"btw\":%ld,\"btb\":%s,\"seq\":%lu,\"pids\":[",
+           g_bt_connected ? "true" : "false", BTS[ph], btw, btb ? "true" : "false",
+           (unsigned long)g_seq);
     for (size_t i = 0; i < N_PIDS; i++) {
         APPEND(json, o,
                "%s{\"name\":\"%s\",\"group\":\"%s\",\"text\":\"%s\",\"raw\":\"%s\","
@@ -996,6 +1116,18 @@ static esp_err_t data_get_handler(httpd_req_t *req)
     xSemaphoreGive(s_snap_mutex);
     APPEND(json, o, "]}");
     return send_json(req, json);
+}
+
+/* "เชื่อมต่อ Bluetooth" button: start a BT scan now. This only runs BT
+ * discovery/connect; nothing is sent to the car, so the safety gate is not
+ * involved. Refused while connected, while a scan or connect is running, and
+ * when the boot self-test kept BT off. */
+static esp_err_t btconnect_get_handler(httpd_req_t *req)
+{
+    if (s_bt_phase == BT_OFF) return send_json(req, "{\"ok\":false,\"err\":\"off\"}");
+    if (s_bt_phase == BT_CONNECTED) return send_json(req, "{\"ok\":false,\"err\":\"connected\"}");
+    bool go = bt_begin_scan(SCAN_MANUAL);
+    return send_json(req, go ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"busy\"}");
 }
 
 /* Dashboard page: poc4's tabbed table plus a "รายงาน" (report) tab. The report
@@ -1050,7 +1182,9 @@ static const char HTML_PAGE[] =
     "<div id=dout></div>"
     "<a id=dsave class=lnk style=display:none>บันทึกข้อมูลดิบ (JSON)</a>"
     "</div>"
-    "<div class=s>BT <span class=dot id=dot></span> &middot; poll #<span id=seq>0</span></div>"
+    "<div class=s>BT <span class=dot id=dot></span> <span id=bts></span>"
+    " &middot; poll #<span id=seq>0</span><br>"
+    "<button id=btgo class=lnk disabled>เชื่อมต่อ Bluetooth</button></div>"
     "<div id=tabs></div>"
     "<script>"
     "var REP='รายงาน',cur=null,last=[];"
@@ -1076,8 +1210,14 @@ static const char HTML_PAGE[] =
     "async function u(){try{let d=await(await fetch('/data')).json();"
     "document.getElementById('seq').textContent=d.seq;"
     "document.getElementById('dot').style.background=d.bt?'#3c3':'#c33';"
+    "var bm={off:'ปิดอยู่ (self-test ไม่ผ่าน)',idle:'ไม่ได้เชื่อมต่อ',scan:'กำลังค้นหา…',"
+    "wait:'ค้นหาใหม่ใน '+d.btw+' วิ',conn:'กำลังเชื่อมต่อ…',ok:'เชื่อมต่อแล้ว'};"
+    "document.getElementById('bts').textContent=bm[d.bts]||'';"
+    "document.getElementById('btgo').disabled=!d.btb;"
     "last=d.pids;tabs();draw();"
     "}catch(e){}}"
+    "document.getElementById('btgo').onclick=async function(){this.disabled=true;"
+    "try{await fetch('/bt/connect');}catch(e){}u();};"
     "setInterval(u,1000);u();"
     "</script><script src=/report.js></script></body></html>";
 
@@ -1125,6 +1265,8 @@ static void http_start(void)
     httpd_register_uri_handler(server, &dtc);
     httpd_uri_t seal  = {.uri = "/seal.svg",  .method = HTTP_GET, .handler = seal_get_handler};
     httpd_register_uri_handler(server, &seal);
+    httpd_uri_t btc   = {.uri = "/bt/connect", .method = HTTP_GET, .handler = btconnect_get_handler};
+    httpd_register_uri_handler(server, &btc);
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &data);
     httpd_register_uri_handler(server, &rep);

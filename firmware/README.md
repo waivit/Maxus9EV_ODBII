@@ -67,11 +67,33 @@ idf.py build flash monitor
 1. Phone joins WiFi `MaxusBridge` (pass `maxus1234`) → open `http://192.168.4.1/`.
 2. Tab **รายงาน** → **สร้างรายงาน**. The dashboard pauses for a few seconds while
    the report set is read fresh.
-3. A preview appears → **บันทึกภาพ** saves `TK-YYMM-NNNN.jpg`. The page has two parts:
-   - **Summary** (large type): SOH, odometer, raw SOC and the cell-voltage spread.
-   - **Technical detail** (small type): highest/lowest cell with index, the
-     battery temperature range, the pack voltage, and a short explanation of how
-     the spread relates to SOH. It gives no verdict.
+3. A preview appears → **บันทึกภาพ** saves `TK-YYMMDD-HHMM.jpg`. The image is a
+   **"รายงานผลการอ่านค่าแบตเตอรี่"**: an A4-proportioned 1414×2000 JPEG
+   (~450 KB) with a double frame, the taladkrub shield seal as a faint red
+   watermark and as the issuer's stamp, and these sections:
+   - **Reference:** report number, car, date and time of the inspection. There is
+     no plate or VIN, because the device has neither by design.
+   - **Key results:** SOH as a 0–100 numeric bar with no pass/fail bands, then the
+     odometer read from the car.
+   - **ความหมายของผล:** the SOH sentence. Its wording changes when SOH could not be
+     read (`อ่านค่าไม่ได้`) or the model has no SOH (`ไม่มีข้อมูล`).
+   - **Supporting data:** raw SOC, cell spread, max/min cell with index,
+     temperature range, pack voltage.
+   - **Method:** read-only OBD, profile and firmware.
+   - **Issuer:** electronic, no person and no signature, then the scope line:
+     taladkrub confirms the values were read from the car at that date and
+     time, and the report is no guarantee of the battery, the car or the
+     odometer. There is no QR, because no public verification page exists yet.
+
+   Wording rule (Design, hub 2026-11-19): the report confirms a reading and
+   certifies nothing about the car. The words "รับรอง", "ผ่านการตรวจ" and
+   "มาตรฐาน" stay out of the title and away from the seal. The seal marks the
+   issuer only.
+
+   The seal shapes are `main/assets/seal.svg`, served at `/seal.svg`. Its Thai
+   text is drawn by `report.js`, because an SVG drawn as an image cannot use the
+   page's fonts. Fonts are the phone's own (no font files on the device).
+   "ตัวอย่างงานออกแบบ" appears in demo only.
 
    On iPhone you can also long-press the preview to save it. Turn the A/C off
    before generating, so the reading is taken close to rest. The 12-module chart
@@ -80,6 +102,21 @@ idf.py build flash monitor
 
 **ตัวอย่าง (ไม่ต้องต่อรถ)** renders a sample from canned bytes, with a watermark and
 no report number. Use it at the desk to check the layout.
+
+### Report number = time of the inspection
+The number is `TK-YYMMDD-HHMM` in Thai time (e.g. `TK-261117-1608`), plus a
+device suffix such as `-B` once there is a second device. Nothing is stored on
+the board, so swapping boards changes nothing.
+- **Time source:** the inspector's phone. The ESP32 has no battery-backed
+  clock and no internet. The phone sends UTC epoch seconds with the request,
+  and the board adds +7 h (Thailand has no DST), so the phone's timezone
+  setting does not matter.
+- **No report** if that time is earlier than the firmware's build date or more
+  than 5 years after it. The phone shows "ตั้งวันเวลาเป็นอัตโนมัติ". A clock set
+  wrong by hand inside that window cannot be detected.
+- Two reports in the same minute are refused, so the number is not repeated.
+  This uses RAM only. Duplicates across boards or reboots are caught by the
+  website (hub H-0140).
 
 ### DTC read (H9, testing)
 On the **รายงาน** tab, below the report, **อ่าน DTC** reads the trouble codes

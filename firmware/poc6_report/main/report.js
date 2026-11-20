@@ -1,34 +1,41 @@
 /*
- * Battery inspection report (taladkrub, hub handoff H-0135).
- * Fetches one fresh snapshot from /report, draws it on a canvas and hands the
- * phone one JPEG. Top half: large-type summary for buyers. Bottom half: small-
- * type technical detail for readers who want the cell-level numbers.
+ * Battery report: "รายงานผลการอ่านค่าแบตเตอรี่" (taladkrub).
+ * Wording rule (Design, 2026-11-19): the report confirms the values were read,
+ * it certifies nothing about the car. No "รับรอง" / "ผ่านการตรวจ" / "มาตรฐาน"
+ * in the title or next to the seal; the seal marks the issuer only.
+ * Fetches one fresh snapshot from /report, draws an A4-proportioned document
+ * on a canvas and hands the phone one JPEG. The same image is the on-screen
+ * preview and the export.
  * Runs on the ESP32's own WiFi with no internet: no libraries, Thai text uses
- * the phone's system fonts, the logo is drawn from its SVG paths (so the
- * canvas is never tainted and toBlob always works).
+ * the phone's system fonts. The seal is a separate vector asset (seal.svg,
+ * same origin, so the canvas stays exportable); its Thai text is drawn here
+ * because an SVG drawn as an image cannot use the page's fonts.
  *
- * Content rules from Design: no VIN, no good/bad colouring of values, no
- * conclusion about battery replacement, SOH and odometer carry fixed captions,
- * temperature included. Assessment bands (docs/findings/16) wait for Design.
+ * Content rules (Design H-0135/H-0138 + the certificate brief): no VIN, no
+ * pass/fail grading or colour bands, no capacity conclusion from SOH, no
+ * signature, no QR until a real verification page exists, every value bound
+ * to the device's JSON, and "อ่านค่าไม่ได้" / "ไม่มีข้อมูล" instead of a 0.
  */
 (function () {
   'use strict';
 
-  /* The module chart stays off real reports until the module formula is
-   * checked at the car (hypothesis H7 b/d). Demo always shows it. */
-  var SHOW_MODULES = false;
-
-  var W = 1080, PAD = 64, MAX_H = 2000;
-  var INK = '#111827', MUTED = '#4b5563', LINE = '#e5e7eb', BAND = '#14181f', LIME = '#b6f23a';
+  var W = 1414, H = 2000;                       /* A4 proportion, long side 2000 */
+  var L = 70, R = W - 70;                       /* content edges */
+  var GRAPHITE = '#1f2329', GREEN = '#1f5a32', LIME = '#b6f23a', MUTED = '#5b6470';
+  var LINE = '#d9dee3', RED = '#b42318', SOFT = '#f1f3f5';
+  var TINT = 'rgba(182,242,58,0.14)';
+  var WATERMARK_ALPHA = 0.10;                   /* brief: start 8-12 %, tune by reading */
   var FONT = '"Noto Sans Thai","Sukhumvit Set",Thonburi,Tahoma,sans-serif';
-  var NA = 'อ่านไม่ได้';
+  var NA = 'อ่านค่าไม่ได้', NODATA = 'ไม่มีข้อมูล';
+  var CARS = { maxus9: 'MAXUS 9' };
   var MONTHS = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
                 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
   var ERRORS = {
     bt: 'ยังไม่ได้เชื่อมต่อ ELM327 · รอให้จุดสถานะ BT ด้านล่างเป็นสีเขียว',
     busy: 'อุปกรณ์กำลังอ่านค่าอยู่ ลองใหม่อีกครั้ง',
     novalues: 'รถไม่ตอบ · ตรวจว่ารถอยู่ในสถานะ READY',
-    nvs: 'ออกเลขรายงานไม่ได้ (หน่วยความจำอุปกรณ์) · ลองใหม่อีกครั้ง'
+    time: 'เวลาในมือถือไม่น่าเชื่อ จึงออกเลขรายงานไม่ได้ · ตั้งวันเวลาเป็นอัตโนมัติแล้วลองใหม่',
+    sameminute: 'เพิ่งออกรายงานในนาทีนี้ · รอสักครู่แล้วลองใหม่'
   };
 
   /* taladkrub mark (public/brand/logo/mark-lime.svg, 24x24 viewBox). */
@@ -42,219 +49,369 @@
     ' 15.3L15.4 16.2C16.9 15.9 18.2 15.5 19.2 15C19.7 14.6 19.5 14 19 13.9Z'
   ];
 
-  var EXPLAIN = [
-    '• ส่วนต่างแรงดันเซลล์บอกความสมดุลของแพ็ก ไม่ได้บอกสุขภาพของเซลล์โดยตรง',
-    '• ความจุที่ใช้ได้ถูกจำกัดด้วยเซลล์ที่อ่อนที่สุด ส่วนต่างกว้างอาจทำให้ใช้ความจุได้ไม่เต็มแม้ SOH สูง',
-    '• SOH เป็นค่าที่ระบบแบตเตอรี่คำนวณภาพรวม ใช้ประกอบกับส่วนต่างได้ แต่แปลงหากันไม่ได้'
-  ];
-
   function $(id) { return document.getElementById(id); }
   function pad(n, w) { var s = String(n); while (s.length < w) s = '0' + s; return s; }
   function commas(n) { return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
 
-  /* "17 พ.ย. 2569 เวลา 14:05 น." from the phone's clock (the ESP32 has none). */
-  function thaiDate(d) {
-    return d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + (d.getFullYear() + 543) +
-      ' เวลา ' + pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ' น.';
+  /* Thai date and time (UTC+7) from the same epoch the device used for the
+   * report number, so the two always agree whatever the phone's timezone is. */
+  function thaiParts(t) {
+    var d = new Date((t + 7 * 3600) * 1000);
+    return {
+      date: d.getUTCDate() + ' ' + MONTHS[d.getUTCMonth()] + ' ' + (d.getUTCFullYear() + 543),
+      time: pad(d.getUTCHours(), 2) + ':' + pad(d.getUTCMinutes(), 2) + ' น.'
+    };
   }
 
-  /* TK-YYMM-NNNN: YYMM from the phone's clock, NNNN from the device's NVS
-   * counter, which never repeats. */
-  function reportNo(d, seq, demo) {
-    if (demo) return 'TK-DEMO';
-    return 'TK-' + pad(d.getFullYear() % 100, 2) + pad(d.getMonth() + 1, 2) + '-' + pad(seq, 4);
+  /* ---------------------------- value binding ---------------------------- */
+  /* A key absent from the JSON = this profile does not read it ("ไม่มีข้อมูล");
+   * present but not ok = the read failed this time ("อ่านค่าไม่ได้"). */
+  function state(v, k) { return !v[k] ? 'none' : (v[k].ok ? 'ok' : 'fail'); }
+  function shown(v, k, fmt) {
+    var s = state(v, k);
+    return s === 'ok' ? fmt(v[k]) : (s === 'fail' ? NA : NODATA);
+  }
+  function fixed(dec, unit) { return function (x) { return x.v.toFixed(dec) + ' ' + unit; }; }
+  function cellFmt(x) { return x.v.toFixed(3) + ' V' + (x.i >= 0 ? '  ·  เซลล์ #' + x.i : ''); }
+
+  function spreadText(v) {
+    var a = state(v, 'cmax'), b = state(v, 'cmin');
+    if (a === 'ok' && b === 'ok') return Math.round((v.cmax.v - v.cmin.v) * 1000) + ' mV';
+    return (a === 'none' || b === 'none') ? NODATA : NA;
   }
 
-  /* Value helpers over the /report "v" object. */
-  function has(v, k) { return !!(v[k] && v[k].ok); }
-  function num(v, k, dec, unit) { return has(v, k) ? v[k].v.toFixed(dec) + ' ' + unit : NA; }
-  function spreadMv(v) {
-    return has(v, 'cmax') && has(v, 'cmin') ? Math.round((v.cmax.v - v.cmin.v) * 1000) : null;
+  function tempText(v) {
+    var a = state(v, 'tlo'), b = state(v, 'thi');
+    if (a === 'ok' && b === 'ok') return v.tlo.v.toFixed(1) + '–' + v.thi.v.toFixed(1) + ' °C';
+    if (a === 'ok' || b === 'ok') return (a === 'ok' ? v.tlo : v.thi).v.toFixed(1) + ' °C';
+    return (a === 'none' && b === 'none') ? NODATA : NA;
   }
 
-  /* No series cell count on the report: there is no published spec, only an
-   * estimate from pack V / cell V (H7 c), and the user chose to show nothing
-   * rather than an estimate (2026-11-17). */
-
-  function tempRange(v) {
-    var a = has(v, 'tlo'), b = has(v, 'thi');
-    if (a && b) return v.tlo.v.toFixed(1) + '–' + v.thi.v.toFixed(1) + ' °C';
-    if (a || b) return (a ? v.tlo : v.thi).v.toFixed(1) + ' °C';
-    return NA;
+  /* SOH wording per state. Never a grade, never "100 - SOH". */
+  function sohCopy(v) {
+    var s = state(v, 'soh');
+    if (s === 'ok') {
+      var p = v.soh.v.toFixed(1);
+      return { big: p + '%', pct: v.soh.v, caption: 'ค่าประเมินที่ระบบรถรายงาน ณ เวลาตรวจ',
+               easy: 'รถรายงานค่าสุขภาพแบตเตอรี่ ' + p + '% ณ เวลาตรวจ',
+               easy2: 'เป็นค่าจากระบบรถ ไม่ใช่ผลทดสอบความจุจริง' };
+    }
+    if (s === 'fail') {
+      return { big: NA, pct: null, caption: 'ครั้งนี้อ่านค่าจากระบบรถไม่ได้',
+               easy: 'ครั้งนี้อ่านค่าสุขภาพแบตเตอรี่จากระบบรถไม่ได้',
+               easy2: 'ค่าอื่นในใบนี้เป็นค่าที่อ่านได้จริง ณ เวลาตรวจ' };
+    }
+    return { big: NODATA, pct: null, caption: 'ยังอ่านค่า SOH ของรุ่นนี้ไม่ได้',
+             easy: 'ยังอ่านค่าสุขภาพแบตเตอรี่ของรถรุ่นนี้ไม่ได้',
+             easy2: 'ค่าอื่นในใบนี้เป็นค่าที่อ่านได้จริง ณ เวลาตรวจ' };
   }
 
   /* ---------------------------- drawing kit ---------------------------- */
 
-  function drawLogo(g, x, y, size) {
+  function font(g, weight, px) { g.font = weight + ' ' + px + 'px ' + FONT; }
+
+  /* Text width that is right for Thai on every phone. On some phones canvas
+   * measureText() (and with it textAlign) under-reports Thai drawn from a
+   * fallback system font: centred lines start at the centre and nothing
+   * shrinks to fit (seen on a real phone, 2026-11-19). The DOM lays Thai out
+   * correctly, so widths come from a hidden span in the same font, and every
+   * alignment is done by hand. A Latin reference, which canvas measures
+   * correctly, cancels any accessibility text scaling the DOM applies. */
+  var meter = null, scaleCache = {};
+  function domWidth(fontCss, s) {
+    if (!meter) {
+      meter = document.createElement('span');
+      meter.style.cssText = 'position:absolute;left:-9999px;top:0;white-space:pre;visibility:hidden;' +
+                            '-webkit-text-size-adjust:none;text-size-adjust:none';
+      document.body.appendChild(meter);
+    }
+    meter.style.font = fontCss;
+    meter.textContent = s;
+    return meter.getBoundingClientRect().width;
+  }
+  function textWidth(g, s) {
+    var f = g.font;
+    if (!(f in scaleCache)) {
+      var ref = 'Battery Report 0123456789', d = domWidth(f, ref), c = g.measureText(ref).width;
+      scaleCache[f] = d > 0 && c > 0 ? c / d : 0;
+    }
+    var k = scaleCache[f], w = k ? domWidth(f, s) * k : 0;
+    return w > 0 ? w : g.measureText(s).width;     /* no DOM: fall back to canvas */
+  }
+
+  /* Draw text, shrinking until it fits maxW. align: 'left' | 'center' | 'right'. */
+  function text(g, s, x, y, weight, px, color, maxW, align) {
+    var w;
+    do { font(g, weight, px); w = textWidth(g, s); px -= 1; } while (px > 14 && maxW && w > maxW);
+    g.fillStyle = color;
+    g.textAlign = 'left';
+    g.fillText(s, x - (align === 'center' ? w / 2 : align === 'right' ? w : 0), y);
+  }
+
+  /* Letter-spaced Latin line (canvas letterSpacing is not on every phone). */
+  function spaced(g, s, cx, y, px, color, gap) {
+    font(g, '600', px);
+    g.fillStyle = color;
+    var w = 0, i;
+    for (i = 0; i < s.length; i++) w += g.measureText(s[i]).width + (i ? gap : 0);
+    var x = cx - w / 2;
+    for (i = 0; i < s.length; i++) { g.fillText(s[i], x, y); x += g.measureText(s[i]).width + gap; }
+  }
+
+  function rule(g, x1, x2, y, h, color) { g.fillStyle = color || LINE; g.fillRect(x1, y, x2 - x1, h || 1); }
+
+  function rrect(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+  }
+
+  function drawLogo(g, x, y, size, color) {
     g.save();
     g.translate(x, y);
     g.scale(size / 24, size / 24);
-    g.fillStyle = LIME;
-    LOGO_CIRCLES.forEach(function (c) {
-      g.beginPath(); g.arc(c[0], c[1], c[2], 0, Math.PI * 2); g.fill();
-    });
+    g.fillStyle = color;
+    LOGO_CIRCLES.forEach(function (c) { g.beginPath(); g.arc(c[0], c[1], c[2], 0, Math.PI * 2); g.fill(); });
     if (window.Path2D) LOGO_PATHS.forEach(function (p) { g.fill(new Path2D(p), 'evenodd'); });
     g.restore();
   }
 
-  /* Draw text at `px`, shrinking until it fits maxW (no wrapping needed). */
-  function fitText(g, text, x, y, weight, px, color, maxW) {
+  /* Thai grapheme clusters: a base character plus its combining marks, so an
+   * arc never separates a vowel or tone mark from its consonant. */
+  function clusters(s) { return s.match(/[^ัิ-ฺ็-๎][ัิ-ฺ็-๎]*/g) || []; }
+
+  /* Text along the top of a circle, reading left to right. */
+  function arcText(g, s, cx, cy, r, px, color) {
+    font(g, '700', px);
     g.fillStyle = color;
-    do { g.font = weight + ' ' + px + 'px ' + FONT; px -= 1; }
-    while (px > 16 && g.measureText(text).width > maxW);
-    g.fillText(text, x, y);
+    g.textAlign = 'left';
+    g.textBaseline = 'middle';
+    var parts = clusters(s), widths = parts.map(function (c) { return textWidth(g, c); });
+    var total = widths.reduce(function (a, b) { return a + b; }, 0) * 1.08 / r;
+    var a = -Math.PI / 2 - total / 2;
+    parts.forEach(function (c, i) {
+      var step = widths[i] * 1.08 / r;
+      var m = a + step / 2;
+      g.save();
+      g.translate(cx + r * Math.cos(m), cy + r * Math.sin(m));
+      g.rotate(m + Math.PI / 2);
+      g.fillText(c, -widths[i] / 2, 0);
+      g.restore();
+      a += step;
+    });
+    g.textAlign = 'left';
+    g.textBaseline = 'alphabetic';
   }
 
-  function rule(g, y, h) { g.fillStyle = LINE; g.fillRect(PAD, y, W - 2 * PAD, h || 2); }
-
-  function watermark(g, H) {
+  /* The seal asset is 400x440 user units; the arc sits above the mark
+   * (centre 200,236) and the ribbon line at y 386 (see seal.svg). */
+  function drawSeal(g, img, x, y, w, alpha, top, ribbon) {
+    if (!img) return;
+    var s = w / 400;
     g.save();
-    g.translate(W / 2, H / 2);
-    g.rotate(-0.5);
-    g.textAlign = 'center';
-    g.fillStyle = 'rgba(220,38,38,0.22)';
-    g.font = '700 96px ' + FONT;
-    g.fillText('ตัวอย่าง', 0, -60);
-    g.font = '700 64px ' + FONT;
-    g.fillText('ไม่ใช่ผลตรวจจริง', 0, 40);
+    g.globalAlpha = alpha;
+    g.drawImage(img, x, y, w, 440 * s);
+    arcText(g, top, x + 200 * s, y + 236 * s, 88 * s, 30 * s, RED);
+    g.textBaseline = 'middle';
+    text(g, ribbon, x + 200 * s, y + 386 * s, '700', 26 * s, RED, 280 * s, 'center');
+    g.textBaseline = 'alphabetic';
     g.restore();
   }
 
-  /* Compact module chart: one vertical range per module from its two
-   * voltages, pack-wide cell max/min as dashed reference lines. */
-  function moduleChart(g, y, d, CH) {
-    var v = d.v, mods = d.mod || [];
-    var LEFT = PAD + 100, RIGHT = W - PAD, colW = (RIGHT - LEFT) / 12;
-    var vals = [];
-    mods.forEach(function (m) { if (m.ok) vals.push(m.va, m.vb); });
-    if (has(v, 'cmax')) vals.push(v.cmax.v);
-    if (has(v, 'cmin')) vals.push(v.cmin.v);
-    if (!vals.length) {
-      fitText(g, 'ราย module: อ่านไม่ได้', PAD, y + 30, '400', 22, MUTED, W - 2 * PAD);
-      return;
-    }
-    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
-    var span = Math.max(hi - lo, 0.01);
-    lo -= span * 0.15; hi += span * 0.15;
-    function yy(x) { return y + CH - (x - lo) / (hi - lo) * CH; }
-
-    g.fillStyle = LINE; g.fillRect(LEFT, y, 1, CH); g.fillRect(LEFT, y + CH, RIGHT - LEFT, 1);
-    fitText(g, hi.toFixed(3) + ' V', PAD, y + 16, '400', 18, MUTED, 95);
-    fitText(g, lo.toFixed(3) + ' V', PAD, y + CH, '400', 18, MUTED, 95);
-
-    g.save();
-    g.setLineDash([8, 6]); g.strokeStyle = MUTED; g.lineWidth = 1.5;
-    ['cmax', 'cmin'].forEach(function (k) {
-      if (!has(v, k)) return;
-      g.beginPath(); g.moveTo(LEFT, yy(v[k].v)); g.lineTo(RIGHT, yy(v[k].v)); g.stroke();
+  function frame(g) {
+    g.strokeStyle = GREEN;
+    g.lineWidth = 3; g.strokeRect(22, 22, W - 44, H - 44);
+    g.lineWidth = 1; g.strokeRect(34, 34, W - 68, H - 68);
+    [[34, 34], [W - 34, 34], [34, H - 34], [W - 34, H - 34]].forEach(function (c) {
+      g.save();
+      g.translate(c[0], c[1]);
+      g.rotate(Math.PI / 4);
+      g.fillStyle = '#ffffff'; g.fillRect(-11, -11, 22, 22);
+      g.strokeStyle = GREEN; g.lineWidth = 1.5; g.strokeRect(-11, -11, 22, 22);
+      g.fillStyle = LIME; g.fillRect(-5, -5, 10, 10);
+      g.restore();
     });
-    g.restore();
+  }
 
-    mods.forEach(function (m, i) {
-      var cx = LEFT + colW * (i + 0.5);
-      g.textAlign = 'center';
-      if (m.ok) {
-        var a = yy(Math.max(m.va, m.vb)), b = yy(Math.min(m.va, m.vb));
-        g.fillStyle = INK;
-        g.fillRect(cx - 3, a, 6, Math.max(b - a, 2));
-        g.beginPath(); g.arc(cx, a, 5, 0, Math.PI * 2); g.fill();
-        g.beginPath(); g.arc(cx, b, 5, 0, Math.PI * 2); g.fill();
-      } else {
-        fitText(g, '—', cx, y + CH / 2, '400', 22, MUTED, colW - 6);
-      }
-      fitText(g, 'M' + (i + 1), cx, y + CH + 28, '700', 18, INK, colW - 6);
-      g.textAlign = 'left';
-    });
-    fitText(g, 'ราย module · เส้นประ = เซลล์สูงสุด/ต่ำสุดของทั้งแพ็ก · ค่าราย module ยังไม่ยืนยันสูตร',
-            PAD, y + CH + 62, '400', 20, MUTED, W - 2 * PAD);
+  /* Dark-green section tab with a lime slash, then a hairline to the edge. */
+  function section(g, y, title) {
+    font(g, '700', 34);
+    var tw = textWidth(g, title), x2 = L + tw + 70;
+    g.fillStyle = GREEN;
+    g.beginPath(); g.moveTo(L, y); g.lineTo(x2 + 20, y); g.lineTo(x2, y + 56); g.lineTo(L, y + 56); g.closePath(); g.fill();
+    g.fillStyle = LIME;
+    g.beginPath(); g.moveTo(x2 + 28, y); g.lineTo(x2 + 44, y); g.lineTo(x2 + 24, y + 56); g.lineTo(x2 + 8, y + 56); g.closePath(); g.fill();
+    text(g, title, L + 26, y + 40, '700', 34, '#ffffff');
+    rule(g, x2 + 30, R, y + 54, 2, GREEN);
   }
 
   /* ------------------------------ the page ------------------------------ */
 
-  function render(d, when, no) {
-    var v = d.v, showMods = SHOW_MODULES || d.demo;
-    var s = spreadMv(v);
-    var inner = W - 2 * PAD;
-
-    /* Summary: large type, for buyers. */
-    var summary = [
-      { t: 'สุขภาพแบตเตอรี่ (SOH)', v: num(v, 'soh', 1, '%'),
-        c: 'ค่าที่ระบบแบตเตอรี่ของรถรายงาน (ยังไม่ได้เทียบกับศูนย์บริการ)' },
-      { t: 'เลขไมล์', v: has(v, 'odo') ? commas(v.odo.v) + ' กม.' : NA,
-        c: 'ข้อมูลประกอบ · อ่านจากชุดควบคุมมอเตอร์' },
-      { t: 'SOC (ค่าดิบ)', v: num(v, 'soc', 1, '%'),
-        c: 'ค่าดิบจากระบบแบตเตอรี่ · ตัวเลขบนหน้าปัดอาจต่างจากนี้' },
-      { t: 'ส่วนต่างแรงดันเซลล์ (สูงสุด − ต่ำสุด)', v: s === null ? NA : s + ' mV',
-        c: 'ตัวเลขดิบ · รายละเอียดด้านล่าง' }
-    ];
-    /* Technical detail: small type. */
-    var cellIdx = function (k) { return has(v, k) && v[k].i >= 0 ? '  ·  เซลล์ #' + v[k].i : ''; };
-    var tech = [
-      ['แรงดันเซลล์สูงสุด', num(v, 'cmax', 3, 'V') + cellIdx('cmax')],
-      ['แรงดันเซลล์ต่ำสุด', num(v, 'cmin', 3, 'V') + cellIdx('cmin')],
-      ['อุณหภูมิแบตเตอรี่', tempRange(v)],
-      ['แรงดันแพ็ก', num(v, 'pv', 1, 'V')]
-    ];
-
-    var TOP = 490, ROW = 150, KV = 42, CH = 110;
-    var yTech = TOP + summary.length * ROW;                 /* rule above tech */
-    var yRows = yTech + 70;
-    var yMods = yRows + tech.length * KV + 10;
-    var yExpl = yMods + (showMods ? CH + 96 : 0);
-    var H = Math.min(MAX_H, yExpl + 46 + EXPLAIN.length * 34 + 130);
-
+  function render(d, when, no, seal) {
+    var v = d.v, soh = sohCopy(v), tp = thaiParts(when);
     var cv = document.createElement('canvas');
     cv.width = W; cv.height = H;
     var g = cv.getContext('2d');
     g.textBaseline = 'alphabetic';
     g.fillStyle = '#ffffff'; g.fillRect(0, 0, W, H);
 
-    /* Header band and identity. */
-    g.fillStyle = BAND; g.fillRect(0, 0, W, 230);
-    drawLogo(g, PAD, 55, 120);
-    fitText(g, 'ตลาดครับ', PAD + 150, 118, '700', 60, '#ffffff', inner - 150);
-    fitText(g, 'รายงานตรวจแบตเตอรี่จากระบบรถ', PAD + 150, 178, '400', 38, '#d1d5db', inner - 150);
-    [['เลขรายงาน', no], ['วันเวลาที่ตรวจ', thaiDate(when)],
-     ['รุ่นรถ', 'MAXUS 9 · โปรไฟล์ ' + d.profile], ['firmware', d.fw]].forEach(function (m, k) {
-      var y = 295 + k * 50;
-      fitText(g, m[0], PAD, y, '400', 30, MUTED, 250);
-      fitText(g, m[1], PAD + 270, y, k === 0 ? '700' : '400', 30, INK, inner - 270);
+    /* Watermark first, so every line of text sits on top of it. */
+    drawSeal(g, seal, W / 2 - 360, 440, 720, WATERMARK_ALPHA, 'ตลาดครับ', 'ผู้ออกรายงาน');
+    frame(g);
+
+    if (d.demo) {                                /* preview only, never on a real report */
+      rrect(g, W / 2 - 200, 4, 400, 56, 28); g.fillStyle = LIME; g.fill();
+      text(g, 'ตัวอย่างงานออกแบบ', W / 2, 43, '700', 30, GRAPHITE, 360, 'center');
+    }
+
+    /* Header */
+    drawLogo(g, 330, 92, 112, '#8ccf1f');
+    text(g, 'ตลาดครับ', 468, 156, '700', 76, GRAPHITE, 380);
+    text(g, 'Taladkrub', 470, 206, '700', 42, GRAPHITE, 380);
+    rule(g, 880, 882, 104, 112, GREEN);
+    text(g, 'ออกโดยตลาดครับ', 914, 170, '400', 32, GRAPHITE, 420);
+
+    text(g, 'รายงานผลการอ่านค่าแบตเตอรี่', W / 2, 314, '700', 68, GRAPHITE, R - L, 'center');
+    spaced(g, 'BATTERY READING REPORT', W / 2, 368, 28, MUTED, 9);
+    rule(g, L, R, 398, 3, GREEN);
+
+    /* 1. Reference (no plate / VIN: the device has neither, by design) */
+    var refL = [['เลขรายงาน', no], ['รถ', CARS[d.profile] || d.profile]];
+    var refR = [['วันที่ตรวจ', tp.date], ['เวลาตรวจ', tp.time]];
+    [refL, refR].forEach(function (col, c) {
+      var x = c ? 760 : L + 10, vx = c ? 950 : L + 230, xe = c ? R : 680;
+      col.forEach(function (r, k) {
+        var y = 456 + k * 58;
+        text(g, r[0], x, y, '400', 30, GRAPHITE, vx - x - 16);
+        text(g, r[1], vx, y, '700', 32, GRAPHITE, xe - vx);
+        rule(g, x - 10, xe, y + 20, 1, LINE);
+      });
     });
-    rule(g, 475);
+    rule(g, 712, 714, 420, 120, LINE);
 
-    /* Summary rows. */
-    summary.forEach(function (r, k) {
-      var y0 = TOP + k * ROW;
-      fitText(g, r.t, PAD, y0 + 36, '400', 30, MUTED, inner);
-      fitText(g, r.v, PAD, y0 + 94, '700', 54, INK, inner);
-      fitText(g, r.c, PAD, y0 + 130, '400', 24, MUTED, inner);
-      if (k < summary.length - 1) rule(g, y0 + ROW - 6, 1);
+    /* 2. Key results */
+    section(g, 568, 'ผลสำคัญที่เจ้าของรถควรรู้');
+    var cy = 646, ch = 290;
+    g.strokeStyle = LINE; g.lineWidth = 2;
+    rrect(g, L, cy, 790, ch, 18); g.stroke();
+    rrect(g, 890, cy, R - 890, ch, 18); g.stroke();
+
+    text(g, 'สุขภาพแบตเตอรี่ (SOH)', L + 40, cy + 58, '700', 36, GRAPHITE, 710);
+    text(g, soh.big, L + 34, cy + 190, '700', soh.pct === null ? 92 : 150, GREEN, 720);
+    text(g, soh.caption, L + 40, cy + 228, '400', 28, GRAPHITE, 710);
+    if (soh.pct !== null) {                      /* numeric scale only, no colour bands */
+      var bx = L + 40, bw = 700, by = cy + 244, pct = Math.max(0, Math.min(100, soh.pct));
+      rrect(g, bx, by, bw, 20, 10); g.fillStyle = '#e6e9ec'; g.fill();
+      if (pct > 0) { rrect(g, bx, by, Math.max(20, bw * pct / 100), 20, 10); g.fillStyle = LIME; g.fill(); }
+      text(g, '0%', bx, by + 44, '400', 22, MUTED);
+      text(g, '100%', bx + bw, by + 44, '400', 22, MUTED, 0, 'right');
+    }
+
+    var ox = (890 + R) / 2;
+    text(g, 'เลขไมล์ที่อ่านได้จากรถ', ox, cy + 70, '700', 34, GRAPHITE, R - 930, 'center');
+    var odo = shown(v, 'odo', function (x) { return commas(x.v) + ' กม.'; });
+    text(g, odo, ox, cy + 190, '700', state(v, 'odo') === 'ok' ? 96 : 70, GREEN, R - 930, 'center');
+    text(g, 'ข้อมูลประกอบ · อ่านจากชุดควบคุมมอเตอร์', ox, cy + 246, '400', 24, MUTED, R - 930, 'center');
+
+    /* 3. Plain-language box */
+    var ey = 960;
+    rrect(g, L, ey, R - L, 130, 18); g.fillStyle = TINT; g.fill();
+    /* Label on two lines so it stays large: "ความหมายของผล" (user, 2026-11-19). */
+    text(g, 'ความหมาย', L + 40, ey + 58, '700', 42, GREEN, 250);
+    text(g, 'ของผล', L + 40, ey + 106, '700', 42, GREEN, 250);
+    rule(g, 330, 332, ey + 22, 86, GREEN);
+    text(g, soh.easy, 370, ey + 58, '700', 36, GRAPHITE, R - 400);
+    text(g, soh.easy2, 370, ey + 102, '400', 28, MUTED, R - 400);
+
+    var ny = 1130;
+    font(g, '400', 26);
+    var nt = 'ไม่มีเกณฑ์ผ่าน–ไม่ผ่านในรายงานนี้', nw = textWidth(g, nt);
+    text(g, nt, W / 2, ny, '400', 26, MUTED, 0, 'center');
+    rule(g, L + 120, W / 2 - nw / 2 - 24, ny - 9, 1, LINE);
+    rule(g, W / 2 + nw / 2 + 24, R - 120, ny - 9, 1, LINE);
+
+    /* 4. Supporting data, as read */
+    section(g, 1152, 'ข้อมูลประกอบ ณ เวลาตรวจ');
+    var rows = [
+      ['ระดับประจุ (SOC ค่าดิบ)', shown(v, 'soc', fixed(1, '%'))],
+      ['ส่วนต่างแรงดันเซลล์ (สูงสุด − ต่ำสุด)', spreadText(v)],
+      ['แรงดันเซลล์สูงสุด', shown(v, 'cmax', cellFmt)],
+      ['แรงดันเซลล์ต่ำสุด', shown(v, 'cmin', cellFmt)],
+      ['อุณหภูมิแบตเตอรี่', tempText(v)],
+      ['แรงดันแพ็ก', shown(v, 'pv', fixed(1, 'V'))]
+    ];
+    var ty = 1226, RH = 44;
+    rows.forEach(function (r, k) {
+      var y = ty + k * RH;
+      text(g, r[0], L + 30, y + 31, '400', 28, GRAPHITE, 600);
+      text(g, r[1], 760, y + 31, '700', 30, GRAPHITE, R - 780);
+      rule(g, L, R, y + RH, 1, LINE);
     });
+    rule(g, 730, 731, ty, rows.length * RH, LINE);
 
-    /* Technical detail. */
-    rule(g, yTech);
-    fitText(g, 'รายละเอียดทางเทคนิค', PAD, yTech + 48, '700', 28, INK, inner);
-    tech.forEach(function (r, k) {
-      var y = yRows + k * KV + 28;
-      fitText(g, r[0], PAD, y, '400', 24, MUTED, 330);
-      fitText(g, r[1], PAD + 340, y, '700', 26, INK, inner - 340);
-    });
-    if (showMods) moduleChart(g, yMods + 10, d, CH);
+    /* 5. Method */
+    var my = ty + rows.length * RH + 18;
+    rrect(g, L, my, R - L, 56, 12); g.fillStyle = SOFT; g.fill();
+    text(g, 'วิธีอ่านค่า:', L + 26, my + 38, '700', 26, GREEN, 160);
+    text(g, 'OBD แบบอ่านอย่างเดียว · โปรไฟล์ ' + d.profile + ' · Firmware ' + d.fw,
+         L + 180, my + 38, '400', 26, GRAPHITE, R - L - 200);
 
-    fitText(g, 'อ่านค่าเหล่านี้อย่างไร', PAD, yExpl + 34, '700', 24, INK, inner);
-    EXPLAIN.forEach(function (t, k) {
-      fitText(g, t, PAD, yExpl + 46 + (k + 1) * 34 - 6, '400', 22, MUTED, inner);
-    });
+    /* 6. Issuer: electronic, no person, no signature, no QR */
+    var iy = my + 80;
+    rule(g, L, R, iy, 2, GRAPHITE);
+    drawSeal(g, seal, L + 30, iy + 8, 192, 1, 'ตลาดครับ', 'เอกสารอิเล็กทรอนิกส์');
+    rule(g, 300, 302, iy + 30, 186, LINE);
+    var ix = (302 + R) / 2;
+    text(g, 'ออกโดยระบบอิเล็กทรอนิกส์ของตลาดครับ', ix, iy + 64, '700', 36, GRAPHITE, R - 340, 'center');
+    text(g, 'เลขรายงาน ' + no, ix, iy + 108, '700', 32, GRAPHITE, R - 340, 'center');
+    text(g, 'ตรวจสอบเลขรายงานได้กับทีมตลาดครับ · taladkrub.com', ix, iy + 150, '400', 26, GRAPHITE,
+         R - 340, 'center');
+    rule(g, ix - 330, ix + 330, iy + 170, 1, LINE);
+    text(g, 'เอกสารนี้ออกโดยระบบ ไม่ต้องลงลายมือชื่อ', ix, iy + 206, '400', 26, MUTED, R - 340, 'center');
 
-    /* Footer. */
-    rule(g, H - 100);
-    fitText(g, 'อ่านจากพอร์ต OBD ของรถแบบอ่านอย่างเดียว ไม่เปลี่ยนค่าใดในรถ',
-            PAD, H - 62, '400', 22, MUTED, inner);
-    fitText(g, 'ตัวเลขทั้งหมดเป็นค่าที่ระบบของรถรายงาน ณ เวลาที่ตรวจ',
-            PAD, H - 28, '400', 22, MUTED, inner);
+    /* Scope and footer */
+    /* Two larger lines: this limit must stay readable on a phone screen.
+     * Wording from Design (hub, 2026-11-19), placed next to the issuer seal. */
+    var sy = iy + 226;
+    rrect(g, L, sy, R - L, 92, 12); g.fillStyle = '#eceff2'; g.fill();
+    var s1 = 'ตลาดครับยืนยันว่าได้อ่านค่าเหล่านี้จากระบบแบตเตอรี่ของรถที่นำมาตรวจ ณ วันเวลาที่ระบุในรายงานนี้';
+    var s2 = 'รายงานนี้ไม่ใช่การรับประกันสภาพแบตเตอรี่ สภาพรถ หรือเลขไมล์';
+    var spx = 32;                                /* one size for both lines: fit the longer one */
+    do { font(g, '700', spx); } while (textWidth(g, s1) > R - L - 40 && --spx > 14);
+    text(g, s1, W / 2, sy + 40, '700', spx, GRAPHITE, R - L - 40, 'center');
+    text(g, s2, W / 2, sy + 78, '700', spx, GRAPHITE, R - L - 40, 'center');
+    text(g, 'taladkrub.com', L + 10, H - 54, '700', 28, GREEN, 300);
+    if (d.demo) text(g, 'ตัวอย่าง · ไม่ใช่รายงานฉบับจริง', R - 10, H - 54, '400', 26, GRAPHITE, 600, 'right');
+    rule(g, 330, d.demo ? 780 : R - 10, H - 64, 1, GREEN);
 
-    if (d.demo) watermark(g, H);
+    if (d.demo) {                                /* a demo must never pass for a real one */
+      g.save();
+      g.translate(W / 2, H / 2);
+      g.rotate(-0.5);
+      text(g, 'ตัวอย่าง', 0, -70, '700', 120, 'rgba(180,35,24,0.14)', 0, 'center');
+      text(g, 'ไม่ใช่ผลตรวจจริง', 0, 50, '700', 80, 'rgba(180,35,24,0.14)', 0, 'center');
+      g.restore();
+    }
     return cv;
+  }
+
+  /* The seal, loaded from the device (same origin) BEFORE the car is read:
+   * a report without its seal is not issued. Two tries, the second one
+   * bypassing any cached failure; a success is kept for later reports. */
+  var sealImg = null;
+  function loadSealOnce(url) {
+    return new Promise(function (resolve) {
+      var img = new Image();
+      img.onload = function () { resolve(img.naturalWidth ? img : null); };
+      img.onerror = function () { resolve(null); };
+      img.src = url;
+    });
+  }
+  function loadSeal() {
+    if (sealImg) return Promise.resolve(sealImg);
+    return loadSealOnce('seal.svg').then(function (img) {
+      return img || loadSealOnce('seal.svg?retry=' + Date.now());
+    }).then(function (img) { sealImg = img; return img; });
   }
 
   /* ------------------------------ output ------------------------------ */
@@ -306,13 +463,24 @@
     busy(true);
     $('rout').innerHTML = '';
     status(demo ? 'กำลังสร้างภาพตัวอย่าง…' : 'กำลังอ่านค่าจากรถ… (ราว 10–15 วินาที)');
-    fetch('/report' + (demo ? '?demo=1' : ''), { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
+    /* The phone's clock (UTC epoch seconds) is the device's only time source. */
+    var now = Math.floor(Date.now() / 1000);
+    var seal = null;
+    /* The seal first: if it cannot load, stop before the car is read, so no
+     * report number is spent on an image without its seal. */
+    loadSeal()
+      .then(function (img) {
+        if (!img) { status('โหลดตราจากอุปกรณ์ไม่ได้ · ลองกดใหม่อีกครั้ง'); return null; }
+        seal = img;
+        return fetch('/report?t=' + now + (demo ? '&demo=1' : ''), { cache: 'no-store' })
+          .then(function (r) { return r.json(); });
+      })
       .then(function (d) {
+        if (!d) return;
         if (!d.ok) { status(ERRORS[d.err] || 'สร้างรายงานไม่ได้'); return; }
-        var when = new Date();
-        var no = reportNo(when, d.seq, d.demo);
-        toJpeg(render(d, when, no), no, function (ok) {
+        var when = d.t > 0 ? d.t : now;
+        var no = d.no;
+        toJpeg(render(d, when, no, seal), no, function (ok) {
           status(!ok ? 'ภาพใหญ่เกิน 2 MB · สร้างภาพไม่ได้' :
                  (d.demo ? 'ภาพตัวอย่าง (ไม่นับเลขรายงาน) · ' : 'เลขรายงาน ' + no + ' · ') +
                  'กด "บันทึกภาพ" หรือกดค้างที่ภาพเพื่อบันทึก');

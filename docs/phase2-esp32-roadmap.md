@@ -220,10 +220,12 @@ every mode is **read-only**.
 | --- | --- | --- |
 | 1 | Safety gate: command allowlist, VIN scrub, 29-bit CAN parsing, version `1.0.0`, JPEG ≤ 2 MB | desk ✅ (self-tests 14/14 + 66/66) · car pending (H8) |
 | 1b | DTC reading (`03 07 0A` on `7DF`, `19 02 FF` on `7E5/7E3/7E4`), opened at the user's request. Shown on the phone with a raw JSON download, not on the report image | desk ✅ (self-tests 24/24 + 80/80, synthetic replies) · car pending (H9) |
-| 2 | Per-model profiles as JSON files on the device, reduced report, warning when the car is not at rest | planned |
-| 3 | Discovery mode: find ECUs, identification DIDs (no VIN), Mode 01, bounded DID sweep, raw log tied to the report number | planned |
+| 1c | Report number `TK-YYMMDD-HHMM` from the phone's clock (UTC + 7 h). No NVS counter, so it does not depend on the board. Refused if the time is implausible or the same minute repeats | desk ✅ (board self-test report 10/10) · not committed (user) |
+| 1d | Report redesigned as "รายงานผลการอ่านค่าแบตเตอรี่" (A4 proportion, seal watermark and issuer stamp, "ความหมายของผล" box, no plate/VIN, no QR, no signature). Renamed from "หนังสือรับรอง…" per Design (2026-11-19): it confirms a reading, it certifies nothing, so no "รับรอง" in the title or next to the seal | desk: rendered for full data, SOH unread, SOH absent, partial data and demo · 1414×2000, ~450 KB · phone render checked by the user · not committed (user) |
+| 2 | Per-model profiles as JSON files on the device, reduced report (no SOH: "ยังอ่านค่า SOH ของรุ่นนี้ไม่ได้"). The not-at-rest current warning is dropped (user, 2026-11-19) | planned |
+| 3 | Discovery mode: find ECUs, identification DIDs (no VIN), Mode 01, bounded DID sweep, raw log tied to the report number, kept on the board until the phone has downloaded it | planned |
 | 4 | Listen-only (`ATMA` + `ATCSM1`), time-boxed | planned |
-| 5 | Next profiles from public data (MG first), unverified until a real car | planned |
+| 5 | Next profiles from public data (MG ZS EV / MG4 first), unverified until a real car | planned |
 
 Policy: [`inspection-safety.md`](inspection-safety.md).
 

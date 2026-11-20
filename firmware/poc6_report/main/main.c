@@ -32,7 +32,6 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "nvs_flash.h"
-#include "nvs.h"
 #include "driver/gpio.h"
 #include "uds.h"
 #include "safety.h"
@@ -537,19 +536,110 @@ static void report_decode_mod(const rep_mod_t *m, const uds_result_t *r, rep_mod
     v->tb = r->data[5] * 0.5f - 40.0f;
 }
 
-/* Next report number from NVS. Survives power cycles and never resets, so a
- * number is never issued twice by this device. Returns 0 on NVS failure. */
-static uint32_t report_counter_next(void)
+/* ============================ Report number ============================ */
+/* TK-YYMMDD-HHMM from the moment the report is taken (H-0138, user's choice).
+ * The ESP32 has no battery-backed clock and no internet (it runs its own AP),
+ * so the time comes from the inspector's phone as UTC epoch seconds (?t=).
+ * Thai time is a fixed UTC+7 (no DST), so the phone's timezone setting does
+ * not matter. Nothing is kept in NVS: swapping boards changes nothing.
+ * Duplicates across boards or reboots are caught by the website (H-0140). */
+#define DEVICE_SUFFIX   ""                       /* set "-B" on a second device */
+#define THAI_UTC_OFFSET (7 * 3600)
+#define TIME_MAX_AHEAD  (5LL * 366 * 86400)      /* beyond this the clock is wrong */
+
+/* Days since 1970-01-01 <-> civil date (Howard Hinnant's algorithms). */
+static void civil_from_days(int64_t z, int *y, int *m, int *d)
 {
-    nvs_handle_t h;
-    uint32_t seq = 0;
-    if (nvs_open("poc6", NVS_READWRITE, &h) != ESP_OK) return 0;
-    nvs_get_u32(h, "rep_seq", &seq);          /* absent on first use -> 0 */
-    seq++;
-    if (nvs_set_u32(h, "rep_seq", seq) != ESP_OK || nvs_commit(h) != ESP_OK) seq = 0;
-    nvs_close(h);
-    return seq;
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yoe + era * 400 + (*m <= 2));
 }
+
+static int64_t days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* __DATE__ ("Nov 17 2026", day space-padded) -> epoch of that day, UTC. */
+static int64_t build_epoch_from(const char *date)
+{
+    static const char MON[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mon[4] = {date[0], date[1], date[2], 0};
+    const char *p = strstr(MON, mon);
+    if (!p || (p - MON) % 3) return -1;
+    int m = (int)(p - MON) / 3 + 1;
+    int d = atoi(date + 4), y = atoi(date + 7);
+    return days_from_civil(y, m, d) * 86400;
+}
+
+/* Plausible = not before this firmware was built (one day of margin), and
+ * not absurdly far after it. A phone clock set wrong by hand inside that
+ * window cannot be detected here. */
+static bool report_time_ok(int64_t t, int64_t build)
+{
+    return build > 0 && t >= build - 86400 && t <= build + TIME_MAX_AHEAD;
+}
+
+static void report_number(int64_t t, char *out, size_t sz)
+{
+    int64_t local = t + THAI_UTC_OFFSET;
+    int64_t days = local / 86400;               /* t is checked > 0 */
+    int64_t sec = local - days * 86400;
+    int y, m, d;
+    civil_from_days(days, &y, &m, &d);
+    snprintf(out, sz, "TK-%02d%02d%02d-%02d%02d%s", y % 100, m, d,
+             (int)(sec / 3600), (int)(sec % 3600 / 60), DEVICE_SUFFIX);
+}
+
+/* Reference epochs computed independently (Python datetime). */
+static int report_selftest(void)
+{
+    static const struct { int64_t t; const char *want; } N[] = {
+        {1794906480LL, "TK-261117-1608"},     /* the example in H-0138          */
+        {1798761540LL, "TK-270101-0659"},     /* UTC is still 2026-12-31        */
+        {1798736340LL, "TK-261231-2359"},
+        {1835395200LL, "TK-280229-0700"},     /* leap day                       */
+    };
+    int fails = 0, total = 0;
+    char no[32];
+    for (size_t i = 0; i < sizeof(N) / sizeof(N[0]); i++, total++) {
+        report_number(N[i].t, no, sizeof(no));
+        if (strcmp(no, N[i].want) != 0) {
+            fails++;
+            ESP_LOGE(TAG, "report selftest FAIL: %lld -> %s, want %s", (long long)N[i].t, no, N[i].want);
+        }
+    }
+    int64_t b1 = build_epoch_from("Nov 17 2026"), b2 = build_epoch_from("Jan  5 2027");
+    total += 2;
+    if (b1 != 1794873600LL) { fails++; ESP_LOGE(TAG, "report selftest FAIL: build date 1"); }
+    if (b2 != 1799107200LL) { fails++; ESP_LOGE(TAG, "report selftest FAIL: build date 2"); }
+    struct { int64_t t; bool ok; } P[] = {
+        {1794906480LL, true}, {1700000000LL, false} /* 2023 */, {0, false},
+        {1794873600LL + 6LL * 366 * 86400, false} /* years ahead */,
+    };
+    for (size_t i = 0; i < sizeof(P) / sizeof(P[0]); i++, total++)
+        if (report_time_ok(P[i].t, b1) != P[i].ok) {
+            fails++;
+            ESP_LOGE(TAG, "report selftest FAIL: plausibility of %lld", (long long)P[i].t);
+        }
+    ESP_LOGI(TAG, "report selftest: %d/%d PASS (regression guard)", total - fails, total);
+    return fails;
+}
+
+/* Last minute a real report was issued, in RAM only (lost on reboot): two
+ * presses in the same minute would otherwise produce the same number. */
+static int64_t s_last_report_minute = -1;
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
 {
@@ -561,10 +651,28 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
 static esp_err_t report_get_handler(httpd_req_t *req)
 {
     bool demo = false;
-    char q[32], v[4];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
-        httpd_query_key_value(q, "demo", v, sizeof(v)) == ESP_OK && v[0] == '1')
-        demo = true;
+    int64_t t = 0;
+    char q[64], v[24];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "demo", v, sizeof(v)) == ESP_OK && v[0] == '1') demo = true;
+        if (httpd_query_key_value(q, "t", v, sizeof(v)) == ESP_OK) t = strtoll(v, NULL, 10);
+    }
+
+    /* The report number is the time, so no trustworthy time = no report.
+     * Checked before touching the car, so a bad clock costs nothing. */
+    static int64_t build = 0;
+    if (!build) build = build_epoch_from(__DATE__);
+    bool time_ok = report_time_ok(t, build);
+    if (!demo) {
+        if (!time_ok) {
+            ESP_LOGW(TAG, "report refused: implausible phone time %lld", (long long)t);
+            return send_json(req, "{\"ok\":false,\"err\":\"time\"}");
+        }
+        if (t / 60 == s_last_report_minute)
+            return send_json(req, "{\"ok\":false,\"err\":\"sameminute\"}");
+    } else if (!time_ok) {
+        t = 0;                                   /* demo: phone shows its own clock */
+    }
 
     static rep_val_t     vals[N_REPORT];      /* static: httpd stack stays small */
     static rep_mod_val_t mods[N_REPORT_MODS];
@@ -612,15 +720,19 @@ static esp_err_t report_get_handler(httpd_req_t *req)
         if (ok_count == 0) return send_json(req, "{\"ok\":false,\"err\":\"novalues\"}");
     }
 
-    /* Only a real report with at least one value consumes a number. */
-    uint32_t seq = demo ? 0 : report_counter_next();
-    if (!demo && seq == 0) return send_json(req, "{\"ok\":false,\"err\":\"nvs\"}");
-    if (!demo) s_led_done = true;            /* 3 quick blinks: report issued */
+    /* Only a real report with at least one value takes a number (minute). */
+    char no[32] = "TK-DEMO";
+    if (!demo) {
+        report_number(t, no, sizeof(no));
+        s_last_report_minute = t / 60;
+        s_led_done = true;                   /* 3 quick blinks: report issued */
+    }
 
     static char json[4096];
     size_t o = 0;
-    APPEND(json, o, "{\"ok\":true,\"demo\":%s,\"seq\":%lu,\"fw\":\"%s\",\"profile\":\"%s\",\"v\":{",
-           demo ? "true" : "false", (unsigned long)seq, FW_VERSION, REPORT_PROFILE);
+    APPEND(json, o, "{\"ok\":true,\"demo\":%s,\"no\":\"%s\",\"t\":%lld,\"fw\":\"%s\","
+           "\"profile\":\"%s\",\"v\":{",
+           demo ? "true" : "false", no, (long long)t, FW_VERSION, REPORT_PROFILE);
     for (size_t i = 0; i < N_REPORT; i++) {
         const rep_val_t *x = &vals[i];
         APPEND(json, o, "%s\"%s\":{\"ok\":%s,\"v\":%.3f,\"i\":%d,\"nrc\":%d,\"raw\":\"%s\"}",
@@ -636,8 +748,8 @@ static esp_err_t report_get_handler(httpd_req_t *req)
                m->va, m->vb, m->ta, m->tb, m->raw);
     }
     APPEND(json, o, "]}");
-    ESP_LOGI(TAG, "report %s seq=%lu: %d/%d values", demo ? "DEMO" : "real",
-             (unsigned long)seq, ok_count, (int)N_REPORT);
+    ESP_LOGI(TAG, "report %s %s: %d/%d values", demo ? "DEMO" : "real",
+             no, ok_count, (int)N_REPORT);
     return send_json(req, json);
 }
 
@@ -984,11 +1096,26 @@ static esp_err_t reportjs_get_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, report_js_start);
 }
 
+/* The report's seal (vector, shapes only - report.js draws its Thai text).
+ * Served from the device so the canvas stays same-origin and exportable. */
+extern const char seal_svg_start[] asm("_binary_seal_svg_start");
+
+static esp_err_t seal_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/svg+xml");
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
+    return httpd_resp_sendstr(req, seal_svg_start);
+}
+
 static void http_start(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;               /* /report reads the ELM327 inline */
+    /* The dashboard polls /data every second and phones keep connections
+     * open, so the socket pool can fill up and refuse /seal.svg. Close the
+     * least recently used connection instead of refusing a new one. */
+    config.lru_purge_enable = true;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     httpd_uri_t root  = {.uri = "/",          .method = HTTP_GET, .handler = root_get_handler};
     httpd_uri_t data  = {.uri = "/data",      .method = HTTP_GET, .handler = data_get_handler};
@@ -996,6 +1123,8 @@ static void http_start(void)
     httpd_uri_t repjs = {.uri = "/report.js", .method = HTTP_GET, .handler = reportjs_get_handler};
     httpd_uri_t dtc   = {.uri = "/dtc",       .method = HTTP_GET, .handler = dtc_get_handler};
     httpd_register_uri_handler(server, &dtc);
+    httpd_uri_t seal  = {.uri = "/seal.svg",  .method = HTTP_GET, .handler = seal_get_handler};
+    httpd_register_uri_handler(server, &seal);
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &data);
     httpd_register_uri_handler(server, &rep);
@@ -1042,6 +1171,7 @@ void app_main(void)
     ESP_LOGI(TAG, "==============================");
     int uds_fails = uds_selftest();
     int safety_fails = safety_selftest();
+    int report_fails = report_selftest();
     xTaskCreate(led_task, "led", 2048, NULL, 2, NULL);
 
     s_snap_mutex = xSemaphoreCreateMutex();
@@ -1054,9 +1184,9 @@ void app_main(void)
     /* Fail-closed: if the safety gate or the parser does not pass its own
      * self-test, never connect to the car. WiFi stays up so the state is
      * visible (BT dot stays red, LED keeps the slow "searching" blink). */
-    if (uds_fails || safety_fails) {
-        ESP_LOGE(TAG, "self-test failed (uds %d, safety %d): NOT connecting to the ELM327",
-                 uds_fails, safety_fails);
+    if (uds_fails || safety_fails || report_fails) {
+        ESP_LOGE(TAG, "self-test failed (uds %d, safety %d, report %d): NOT connecting to the ELM327",
+                 uds_fails, safety_fails, report_fails);
         return;
     }
     bt_init();
